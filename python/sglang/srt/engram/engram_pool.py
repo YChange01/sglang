@@ -85,7 +85,7 @@ class EngramPool:
             client = KVClient(
                 host=host,
                 port=port,
-                connect_timeout_ms=self.config.connect_timeout_ms,
+                timeout_ms=self.config.connect_timeout_ms,
                 req_timeout_ms=self.config.req_timeout_ms,
                 enable_cross_node_connection=self.config.enable_cross_node_connection,
             )

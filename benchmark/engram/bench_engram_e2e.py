@@ -146,7 +146,7 @@ def create_kv_client(host, port, use_mock=False):
     if use_mock:
         return MockKVClient()
     from yr.datasystem import KVClient
-    client = KVClient(host=host, port=port, connect_timeout_ms=60000, req_timeout_ms=10000)
+    client = KVClient(host=host, port=port, timeout_ms=60000, req_timeout_ms=10000)
     client.init()
     return client
 
