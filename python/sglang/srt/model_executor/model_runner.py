@@ -2476,6 +2476,66 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                         self.max_running_requests, chunked_prefill_size, self.device
                     )
 
+        # Initialize Engram remote pool if enabled
+        self.engram_pool = None
+        self.engram_prefetcher = None
+        self.engram_embedding_module = None
+        self._maybe_init_engram_pool()
+
+    def _maybe_init_engram_pool(self):
+        """Initialize Engram remote embedding pool (UB/URMA backend)."""
+        from sglang.srt.engram.engram_config import EngramPoolConfig
+
+        engram_config = EngramPoolConfig.from_server_args(self.server_args)
+        if not engram_config.enabled:
+            return
+
+        from sglang.srt.engram.engram_embedding import RemoteEngramEmbedding
+        from sglang.srt.engram.engram_pool import EngramPool
+        from sglang.srt.engram.engram_prefetcher import EngramPrefetcher
+
+        logger.info("Initializing Engram remote pool...")
+
+        # Create pool and prefetcher
+        self.engram_pool = EngramPool(engram_config)
+        self.engram_pool.initialize()
+        self.engram_prefetcher = EngramPrefetcher(self.engram_pool, engram_config)
+
+        # Find the RemoteEngramEmbedding module and attach prefetcher
+        for module in self.model.modules():
+            if isinstance(module, RemoteEngramEmbedding):
+                module.prefetcher = self.engram_prefetcher
+                self.engram_embedding_module = module
+
+                # Load embedding tables to remote pool (rank 0 only)
+                if self.tp_rank == 0:
+                    self._load_engram_tables_to_pool(module)
+                break
+
+        logger.info("Engram remote pool initialized")
+
+    def _load_engram_tables_to_pool(self, module):
+        """Upload Engram embedding weights to remote pool and free GPU memory."""
+        from sglang.srt.engram.engram_embedding import RemoteEngramEmbedding
+
+        weights = module.get_oe_table_weights()
+        if weights is None:
+            logger.warning("No oe_embeder weights found to load into pool")
+            return
+
+        n_grams = module.n_grams
+        sums = module.exclusive_oe_embedder_size_sums.cpu().numpy()
+
+        for t in range(n_grams):
+            start = int(sums[t])
+            end = int(sums[t + 1])
+            table_weights = weights[start:end]  # [table_rows, oe_hidden_dim]
+            self.engram_pool.load_table(t, table_weights)
+
+        # Free GPU memory
+        module.offload_oe_table()
+        logger.info("Engram tables loaded to pool and GPU memory freed")
+
     def maybe_update_ngram_token_table(
         self,
         next_token_ids: torch.Tensor,
@@ -2921,6 +2981,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_batch.hisparse_coordinator = self.hisparse_coordinator
         if self.hisparse_coordinator is not None:
             self.hisparse_coordinator.num_real_reqs.fill_(forward_batch.batch_size)
+
+        # Trigger Engram async prefetch (overlaps with Transformer compute)
+        if self.engram_embedding_module is not None:
+            forward_batch.engram_prefetch_request = (
+                self.engram_embedding_module.trigger_prefetch(forward_batch)
+            )
 
         if forward_batch.forward_mode.is_decode():
             ret = self.forward_decode(

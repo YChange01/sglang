@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import IntEnum, auto
 from functools import total_ordering
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -428,6 +428,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For ngram embedding
     ngram_embedding_info: Optional[NgramEmbeddingInfo] = None
+
+    # For Engram remote pool prefetch (set by ModelRunner before forward)
+    engram_prefetch_request: Optional[Any] = None
 
     # For dumper: request IDs for cross-step sequence tracking
     rids: Optional[List[str]] = None

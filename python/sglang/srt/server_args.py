@@ -748,6 +748,20 @@ class ServerArgs:
     # For forward hooks
     forward_hooks: Optional[List[dict[str, Any]]] = None
 
+    # Engram remote embedding pool (via yuanrong-datasystem UB/URMA)
+    engram_pool_enabled: bool = False
+    engram_pool_hosts: str = ""  # Comma-separated Worker IPs
+    engram_pool_ports: str = ""  # Comma-separated Worker ports (default 18482)
+    engram_pool_etcd: str = ""  # ETCD address for cluster discovery
+    engram_pool_timeout_ms: int = 60000
+    engram_pool_req_timeout_ms: int = 5000
+    engram_pool_prefetch_ahead: int = 2
+    engram_pool_num_workers: int = 4  # Prefetch thread pool size
+    engram_pool_chunk_size: int = 1  # Rows per KV entry
+    engram_pool_key_prefix: str = "engram"
+    engram_pool_shard_strategy: str = "hash"
+    engram_pool_cross_node: bool = False
+
     def __post_init__(self):
         """
         Orchestrates the handling of various server arguments, ensuring proper configuration and validation.
