@@ -26,12 +26,15 @@
  *   2 — all SDK calls succeeded but cluster has < 2 hosts (not ready yet)
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
 #include <stdint.h>
+#include <stdbool.h>    /* ubs_mem_def.h uses `bool` without including this */
 
 #include <ubs_mem.h>
 #include <ubs_mem_def.h>
