@@ -28,10 +28,11 @@ int main(int argc, char* argv[])
     printf("Allocating %.1f MB for %d rows x %d dim...\n",
            total_bytes / 1e6, num_rows, dim);
 
-    /* Allocate and fill with random data */
-    float* data = (float*)aligned_alloc(4096, total_bytes);
-    if (!data) {
-        fprintf(stderr, "Failed to allocate %zu bytes\n", total_bytes);
+    /* Allocate page-aligned memory (URMA requires page alignment) */
+    float* data = NULL;
+    int alloc_rc = posix_memalign((void**)&data, 4096, total_bytes);
+    if (alloc_rc != 0 || !data) {
+        fprintf(stderr, "Failed to allocate %zu bytes (rc=%d)\n", total_bytes, alloc_rc);
         return 1;
     }
 

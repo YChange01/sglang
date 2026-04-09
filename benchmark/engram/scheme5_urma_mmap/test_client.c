@@ -34,12 +34,12 @@ int main(int argc, char* argv[])
 
     urma_mmap_seg_info_t remote_info;
     memset(&remote_info, 0, sizeof(remote_info));
-    remote_info.seg_va = (uint64_t)atol(argv[1]);
-    remote_info.seg_len = (uint64_t)atol(argv[2]);
-    remote_info.seg_id = (uint32_t)atoi(argv[3]);
+    remote_info.seg_va = strtoull(argv[1], NULL, 10);
+    remote_info.seg_len = strtoull(argv[2], NULL, 10);
+    remote_info.seg_id = (uint32_t)strtoul(argv[3], NULL, 10);
     hex_to_bytes(argv[4], remote_info.eid, sizeof(remote_info.eid));
-    remote_info.uasid = (uint32_t)atoi(argv[5]);
-    remote_info.token = 0xACFE;
+    remote_info.uasid = (uint32_t)strtoul(argv[5], NULL, 10);
+    remote_info.token = URMA_MMAP_DEFAULT_TOKEN;
 
     int num_rows = (argc > 6) ? atoi(argv[6]) : 10000;
     int dim = (argc > 7) ? atoi(argv[7]) : 341;

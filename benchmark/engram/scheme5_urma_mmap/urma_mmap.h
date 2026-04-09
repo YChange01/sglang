@@ -23,6 +23,9 @@
 extern "C" {
 #endif
 
+/* Default access token (must match between server and client) */
+#define URMA_MMAP_DEFAULT_TOKEN 0xACFE
+
 /* Error codes */
 #define URMA_MMAP_OK          0
 #define URMA_MMAP_ERR_INIT   -1

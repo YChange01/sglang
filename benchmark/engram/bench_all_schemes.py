@@ -86,8 +86,9 @@ def bench_scheme2(host, port, max_rows, batch_sizes, num_iters):
 
 
 def bench_scheme3(host, port, max_rows, batch_sizes, num_iters):
+    """IPC mode — only works when client is on the same node as the Worker."""
     print("\n" + "=" * 60)
-    print("[Scheme 3] KV IPC + Worker-URMA")
+    print("[Scheme 3] KV IPC (same-node shared memory)")
     print("=" * 60)
     from yr.datasystem import KVClient
     c = KVClient(host=host, port=port, timeout_ms=60000, req_timeout_ms=10000,
@@ -147,13 +148,13 @@ def bench_scheme4(host, port, max_rows, batch_sizes, num_iters):
     client = ObjectClient(host=host, port=port, timeout_ms=60000)
     client.init()
 
-    # Load tables as large buffers
-    tables = []
+    # Load tables as large contiguous buffers
+    print(f"  Loading {NUM_TABLES} tables ({max_rows} rows x {DIM}d each)...")
     for t in range(NUM_TABLES):
         key = f"engram_shm:t{t}"
         data = np.random.randn(max_rows, DIM).astype(np.float32).tobytes()
-        client.g_increase_ref([key])
         client.put(key, data)
+        client.g_increase_ref([key])  # ref after put
 
     # Open memoryviews
     keys = [f"engram_shm:t{t}" for t in range(NUM_TABLES)]

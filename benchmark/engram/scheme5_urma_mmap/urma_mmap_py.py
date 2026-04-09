@@ -44,6 +44,25 @@ def _load_lib():
 
 
 # ------------------------------------------------------------------ #
+#  C struct layout (defined once at module level)
+# ------------------------------------------------------------------ #
+
+class CSegInfo(ctypes.Structure):
+    """Matches urma_mmap_seg_info_t in urma_mmap.h.
+    Uses c_ubyte for eid to avoid null-termination truncation."""
+    _fields_ = [
+        ("eid", ctypes.c_ubyte * 64),
+        ("uasid", ctypes.c_uint32),
+        ("seg_va", ctypes.c_uint64),
+        ("seg_len", ctypes.c_uint64),
+        ("seg_id", ctypes.c_uint32),
+        ("token", ctypes.c_uint32),
+    ]
+
+URMA_MMAP_DEFAULT_TOKEN = 0xACFE
+
+
+# ------------------------------------------------------------------ #
 #  Segment info (exchanged between server and client)
 # ------------------------------------------------------------------ #
 
@@ -72,21 +91,12 @@ class SegInfo:
             return cls(**json.load(f))
 
     def to_c_struct(self):
-        """Convert to ctypes struct for C API."""
-
-        class CSegInfo(ctypes.Structure):
-            _fields_ = [
-                ("eid", ctypes.c_char * 64),
-                ("uasid", ctypes.c_uint32),
-                ("seg_va", ctypes.c_uint64),
-                ("seg_len", ctypes.c_uint64),
-                ("seg_id", ctypes.c_uint32),
-                ("token", ctypes.c_uint32),
-            ]
-
+        """Convert to ctypes CSegInfo for C API."""
         info = CSegInfo()
         eid_bytes = bytes.fromhex(self.eid_hex)
-        info.eid = eid_bytes[:64].ljust(64, b'\x00')
+        # Copy as ubyte array (no null-termination truncation)
+        for i, b in enumerate(eid_bytes[:64]):
+            info.eid[i] = b
         info.uasid = self.uasid
         info.seg_va = self.seg_va
         info.seg_len = self.seg_len
@@ -101,6 +111,18 @@ class SegInfo:
 
 class UrmaMmapServer:
     """Register local memory as URMA segment for remote access."""
+
+    @staticmethod
+    def alloc_page_aligned(shape, dtype=np.float32) -> np.ndarray:
+        """Allocate a page-aligned numpy array (required by URMA)."""
+        import mmap as _mmap
+        nbytes = int(np.prod(shape)) * np.dtype(dtype).itemsize
+        # Round up to page boundary
+        nbytes_aligned = (nbytes + 4095) & ~4095
+        buf = _mmap.mmap(-1, nbytes_aligned)
+        arr = np.frombuffer(buf, dtype=dtype, count=int(np.prod(shape))).reshape(shape)
+        arr._mmap_buf = buf  # prevent GC
+        return arr
 
     def __init__(self, dev_name: Optional[str] = None, eid_index: int = -1):
         lib = _load_lib()
@@ -117,19 +139,15 @@ class UrmaMmapServer:
         """Register a numpy array as URMA segment.
 
         The array must stay alive as long as the segment is registered.
+        URMA requires page-aligned memory; use alloc_page_aligned() to create arrays.
         """
         if not data.flags["C_CONTIGUOUS"]:
             raise ValueError("Array must be C-contiguous")
-
-        class CSegInfo(ctypes.Structure):
-            _fields_ = [
-                ("eid", ctypes.c_char * 64),
-                ("uasid", ctypes.c_uint32),
-                ("seg_va", ctypes.c_uint64),
-                ("seg_len", ctypes.c_uint64),
-                ("seg_id", ctypes.c_uint32),
-                ("token", ctypes.c_uint32),
-            ]
+        if data.ctypes.data % 4096 != 0:
+            raise ValueError(
+                "Array must be page-aligned (4096). "
+                "Use UrmaMmapServer.alloc_page_aligned() to create the array."
+            )
 
         info = CSegInfo()
         addr = data.ctypes.data_as(ctypes.c_void_p)
@@ -141,7 +159,8 @@ class UrmaMmapServer:
         if rc != 0:
             raise RuntimeError(f"urma_mmap_register failed: {rc}")
 
-        eid_hex = bytes(info.eid).hex()
+        # Read eid as ubyte array → hex (no null-termination issue)
+        eid_hex = bytes(bytearray(info.eid)).hex()
         return SegInfo(
             eid_hex=eid_hex,
             uasid=info.uasid,
@@ -157,6 +176,9 @@ class UrmaMmapServer:
         if self._ctx:
             self._lib.urma_mmap_destroy(ctypes.c_void_p(self._ctx))
             self._ctx = None
+
+    def __del__(self):
+        self.destroy()
 
 
 # ------------------------------------------------------------------ #
@@ -211,10 +233,22 @@ class UrmaMmapClient:
         return arr
 
     def destroy(self):
+        """Release all resources. WARNING: any numpy arrays from mmap_import
+        become invalid after this call — do not access them."""
+        # Clear numpy refs first (they point to mapped VA)
+        self._mapped_tables.clear()
         if self._ctx:
             self._lib.urma_mmap_destroy(ctypes.c_void_p(self._ctx))
             self._ctx = None
-            self._mapped_tables.clear()
+
+    def __del__(self):
+        self.destroy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.destroy()
 
 
 # ------------------------------------------------------------------ #

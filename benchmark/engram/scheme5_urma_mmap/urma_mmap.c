@@ -21,8 +21,8 @@
 #define LOG_ERR(fmt, ...) fprintf(stderr, "[urma_mmap ERROR] " fmt "\n", ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...) fprintf(stdout, "[urma_mmap INFO] " fmt "\n", ##__VA_ARGS__)
 
-/* Default token value (must match between server and client) */
-#define DEFAULT_TOKEN 0xACFE
+/* Use the token from the header */
+#define DEFAULT_TOKEN URMA_MMAP_DEFAULT_TOKEN
 
 struct urma_mmap_ctx {
     urma_context_t*  urma_ctx;
@@ -217,6 +217,7 @@ int urma_mmap_import(urma_mmap_ctx_t* ctx, const urma_mmap_seg_info_t* remote_in
     urma_seg_t remote_seg;
     memset(&remote_seg, 0, sizeof(remote_seg));
     memcpy(remote_seg.ubva.eid.raw, remote_info->eid, URMA_EID_SIZE);
+    remote_seg.ubva.uasid = remote_info->uasid;
     remote_seg.ubva.va = remote_info->seg_va;
     remote_seg.len = remote_info->seg_len;
     remote_seg.seg_id = remote_info->seg_id;
