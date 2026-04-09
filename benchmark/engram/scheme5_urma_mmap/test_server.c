@@ -74,7 +74,7 @@ int main(int argc, char* argv[])
     printf("  \"uasid\": %u,\n", info.uasid);
     printf("  \"seg_va\": %lu,\n", info.seg_va);
     printf("  \"seg_len\": %lu,\n", info.seg_len);
-    printf("  \"seg_id\": %u,\n", info.seg_id);
+    printf("  \"token_id\": %u,\n", info.token_id);
     printf("  \"token\": %u,\n", info.token);
     printf("  \"num_rows\": %d,\n", num_rows);
     printf("  \"dim\": %d\n", dim);

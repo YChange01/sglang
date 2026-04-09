@@ -55,7 +55,7 @@ class CSegInfo(ctypes.Structure):
         ("uasid", ctypes.c_uint32),
         ("seg_va", ctypes.c_uint64),
         ("seg_len", ctypes.c_uint64),
-        ("seg_id", ctypes.c_uint32),
+        ("token_id", ctypes.c_uint32),
         ("token", ctypes.c_uint32),
     ]
 
@@ -69,14 +69,16 @@ URMA_MMAP_DEFAULT_TOKEN = 0xACFE
 class SegInfo:
     """Segment info for URMA import."""
 
-    def __init__(self, eid_hex: str, uasid: int, seg_va: int, seg_len: int,
-                 seg_id: int, token: int = 0xACFE,
-                 num_rows: int = 0, dim: int = 0):
-        self.eid_hex = eid_hex
+    def __init__(self, eid_hex: str = "", uasid: int = 0, seg_va: int = 0,
+                 seg_len: int = 0, token_id: int = 0,
+                 token: int = URMA_MMAP_DEFAULT_TOKEN,
+                 num_rows: int = 0, dim: int = 0,
+                 **kwargs):
+        self.eid_hex = eid_hex or kwargs.get("eid", "")
         self.uasid = uasid
         self.seg_va = seg_va
         self.seg_len = seg_len
-        self.seg_id = seg_id
+        self.token_id = token_id or kwargs.get("seg_id", 0)  # backward compat
         self.token = token
         self.num_rows = num_rows
         self.dim = dim
@@ -100,7 +102,7 @@ class SegInfo:
         info.uasid = self.uasid
         info.seg_va = self.seg_va
         info.seg_len = self.seg_len
-        info.seg_id = self.seg_id
+        info.token_id = self.token_id
         info.token = self.token
         return info
 
@@ -166,7 +168,7 @@ class UrmaMmapServer:
             uasid=info.uasid,
             seg_va=info.seg_va,
             seg_len=info.seg_len,
-            seg_id=info.seg_id,
+            token_id=info.token_id,
             token=info.token,
             num_rows=data.shape[0] if data.ndim >= 1 else 0,
             dim=data.shape[1] if data.ndim >= 2 else data.shape[0],
@@ -229,7 +231,7 @@ class UrmaMmapClient:
             arr_type.from_address(mapped_ptr.value)
         ).reshape(nrows, d)
 
-        self._mapped_tables[info.seg_id] = arr
+        self._mapped_tables[info.token_id] = arr
         return arr
 
     def destroy(self):

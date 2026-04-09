@@ -1,10 +1,9 @@
 /**
  * URMA MMAP: Direct remote memory mapping via UB/URMA.
  *
- * Implementation using liburma.so API. The key difference from
- * yuanrong-datasystem's UrmaManager is:
- *   importSegmentFlag.mapping = URMA_SEG_MAP  (not NOMAP)
- * This enables direct load/store to remote memory via UBMMU.
+ * Uses URMA_SEG_MAPPED flag on urma_import_seg to map remote memory
+ * into local virtual address space. After mapping, direct load/store
+ * access works via UBMMU hardware translation.
  */
 
 #include "urma_mmap.h"
@@ -65,7 +64,6 @@ urma_mmap_ctx_t* urma_mmap_init(const char* dev_name, int eid_index)
     const char* name = dev_name ? dev_name : "ubcore";
     ctx->urma_dev = urma_get_device_by_name((char*)name);
     if (!ctx->urma_dev) {
-        /* Try bonding device as fallback */
         ctx->urma_dev = urma_get_device_by_name("bonding_dev_0");
     }
     if (!ctx->urma_dev) {
@@ -110,9 +108,9 @@ urma_mmap_ctx_t* urma_mmap_init(const char* dev_name, int eid_index)
                               URMA_ACCESS_REMOTE_WRITE | URMA_ACCESS_REMOTE_ATOMIC;
 #endif
 
-    /* Setup import flags — KEY DIFFERENCE: URMA_SEG_MAP instead of NOMAP */
+    /* Setup import flags — URMA_SEG_MAPPED enables memory mapping */
     ctx->import_flag.bs.cacheable = URMA_NON_CACHEABLE;
-    ctx->import_flag.bs.mapping = URMA_SEG_MAP;  /* ← Enable memory mapping! */
+    ctx->import_flag.bs.mapping = URMA_SEG_MAPPED;  /* ← Enable memory mapping! */
     ctx->import_flag.bs.reserved = 0;
 #ifdef URMA_OVER_UB
     ctx->import_flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE | URMA_ACCESS_ATOMIC;
@@ -121,7 +119,12 @@ urma_mmap_ctx_t* urma_mmap_init(const char* dev_name, int eid_index)
                                  URMA_ACCESS_REMOTE_WRITE | URMA_ACCESS_REMOTE_ATOMIC;
 #endif
 
-    LOG_INFO("Context created (eid_index=%u)", eid_idx);
+    LOG_INFO("Context created (eid_index=%u, eid=%02x%02x%02x%02x...)",
+             eid_idx,
+             (unsigned char)ctx->urma_ctx->eid.raw[0],
+             (unsigned char)ctx->urma_ctx->eid.raw[1],
+             (unsigned char)ctx->urma_ctx->eid.raw[2],
+             (unsigned char)ctx->urma_ctx->eid.raw[3]);
     return ctx;
 }
 
@@ -142,8 +145,8 @@ void urma_mmap_destroy(urma_mmap_ctx_t* ctx)
         ctx->urma_ctx = NULL;
     }
     urma_uninit();
-    free(ctx);
     LOG_INFO("Context destroyed");
+    free(ctx);
 }
 
 int urma_mmap_get_eid(urma_mmap_ctx_t* ctx, char* eid_out, size_t eid_len)
@@ -176,27 +179,31 @@ int urma_mmap_register(urma_mmap_ctx_t* ctx, void* addr, uint64_t len,
 
     urma_target_seg_t* seg = urma_register_seg(ctx->urma_ctx, &seg_cfg);
     if (!seg) {
-        LOG_ERR("urma_register_seg failed (addr=%p, len=%lu)", addr, len);
+        LOG_ERR("urma_register_seg failed (addr=%p, len=%lu)", addr, (unsigned long)len);
         return URMA_MMAP_ERR_REG;
     }
 
     ctx->local_seg = seg;
 
-    /* Fill output info for client-side import */
-    memcpy(info_out->eid, ctx->urma_ctx->eid.raw, sizeof(info_out->eid));
-    info_out->uasid = ctx->urma_ctx->uasid;
-    info_out->seg_va = seg->seg.va;
+    /* Fill output info for client-side import.
+     * urma_seg_t has: ubva (contains eid, uasid, va), len, attr, token_id */
+    memcpy(info_out->eid, seg->seg.ubva.eid.raw, sizeof(info_out->eid));
+    info_out->uasid = seg->seg.ubva.uasid;
+    info_out->seg_va = seg->seg.ubva.va;
     info_out->seg_len = seg->seg.len;
-    info_out->seg_id = seg->seg.seg_id;
+    info_out->token_id = seg->seg.token_id;
     info_out->token = DEFAULT_TOKEN;
 
-    LOG_INFO("Registered segment: va=0x%lx, len=%lu, seg_id=%u",
-             seg->seg.va, seg->seg.len, seg->seg.seg_id);
+    LOG_INFO("Registered segment: ubva.va=0x%lx, len=%lu, token_id=%u",
+             (unsigned long)seg->seg.ubva.va,
+             (unsigned long)seg->seg.len,
+             seg->seg.token_id);
     return URMA_MMAP_OK;
 }
 
 int urma_mmap_unregister(urma_mmap_ctx_t* ctx, urma_mmap_seg_info_t* info)
 {
+    (void)info;
     if (!ctx || !ctx->local_seg) return URMA_MMAP_ERR_PARAM;
     urma_status_t rc = urma_unregister_seg(ctx->local_seg);
     ctx->local_seg = NULL;
@@ -220,33 +227,35 @@ int urma_mmap_import(urma_mmap_ctx_t* ctx, const urma_mmap_seg_info_t* remote_in
     remote_seg.ubva.uasid = remote_info->uasid;
     remote_seg.ubva.va = remote_info->seg_va;
     remote_seg.len = remote_info->seg_len;
-    remote_seg.seg_id = remote_info->seg_id;
+    remote_seg.token_id = remote_info->token_id;
 
     urma_token_t token;
     token.token = remote_info->token;
 
-    /* Import with URMA_SEG_MAP — this creates a local VA mapping */
+    /* Import with URMA_SEG_MAPPED — this creates a local VA mapping.
+     * After import, imported->mva is the local virtual address. */
     urma_target_seg_t* imported = urma_import_seg(
         ctx->urma_ctx, &remote_seg, &token, 0, ctx->import_flag);
 
     if (!imported) {
-        LOG_ERR("urma_import_seg (MAP) failed for remote eid, seg_va=0x%lx",
-                remote_info->seg_va);
+        LOG_ERR("urma_import_seg (MAPPED) failed for remote ubva.va=0x%lx",
+                (unsigned long)remote_info->seg_va);
         return URMA_MMAP_ERR_IMPORT;
     }
 
     ctx->imported_seg = imported;
 
-    /* The mapped address — UBMMU handles translation on access */
-    *mapped_addr = (void*)imported->seg.va;
+    /* The mapped address is in imported->mva (mapping virtual address) */
+    *mapped_addr = (void*)imported->mva;
 
-    LOG_INFO("Imported+mapped remote segment: local_va=%p, len=%lu",
-             *mapped_addr, imported->seg.len);
+    LOG_INFO("Imported+mapped remote segment: mva=%p, len=%lu",
+             *mapped_addr, (unsigned long)imported->seg.len);
     return URMA_MMAP_OK;
 }
 
 int urma_mmap_unimport(urma_mmap_ctx_t* ctx, const urma_mmap_seg_info_t* remote_info)
 {
+    (void)remote_info;
     if (!ctx || !ctx->imported_seg) return URMA_MMAP_ERR_PARAM;
     urma_status_t rc = urma_unimport_seg(ctx->imported_seg);
     ctx->imported_seg = NULL;
@@ -261,6 +270,13 @@ int urma_mmap_unimport(urma_mmap_ctx_t* ctx, const urma_mmap_seg_info_t* remote_
 void urma_mmap_dump_info(const urma_mmap_seg_info_t* info)
 {
     if (!info) return;
-    printf("SegInfo: seg_va=0x%lx, seg_len=%lu, seg_id=%u, uasid=%u, token=0x%x\n",
-           info->seg_va, info->seg_len, info->seg_id, info->uasid, info->token);
+    printf("SegInfo: ubva.va=0x%lx, len=%lu, token_id=%u, uasid=%u, token=0x%x\n",
+           (unsigned long)info->seg_va,
+           (unsigned long)info->seg_len,
+           info->token_id,
+           info->uasid,
+           info->token);
+    printf("  EID: ");
+    for (int i = 0; i < 16; i++) printf("%02x", (unsigned char)info->eid[i]);
+    printf("...\n");
 }

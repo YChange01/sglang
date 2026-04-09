@@ -45,12 +45,12 @@ typedef struct urma_mmap_ctx urma_mmap_ctx_t;
  * Server fills this after register, client uses it to import.
  */
 typedef struct {
-    char eid[64];           /* Endpoint ID (string representation) */
+    char eid[64];           /* Endpoint ID (raw binary, URMA_EID_SIZE bytes) */
     uint32_t uasid;         /* User Address Space ID */
-    uint64_t seg_va;        /* Segment virtual address */
+    uint64_t seg_va;        /* Segment virtual address (ubva.va) */
     uint64_t seg_len;       /* Segment length in bytes */
-    uint32_t seg_id;        /* Segment ID */
-    uint32_t token;         /* Access token */
+    uint32_t token_id;      /* Token ID from urma_seg_t.token_id */
+    uint32_t token;         /* Access token value */
 } urma_mmap_seg_info_t;
 
 /**

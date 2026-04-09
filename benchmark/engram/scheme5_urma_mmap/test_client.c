@@ -28,7 +28,7 @@ static void hex_to_bytes(const char* hex, char* out, size_t out_len)
 int main(int argc, char* argv[])
 {
     if (argc < 6) {
-        fprintf(stderr, "Usage: %s <seg_va> <seg_len> <seg_id> <eid_hex> <uasid> [num_rows] [dim]\n", argv[0]);
+        fprintf(stderr, "Usage: %s <seg_va> <seg_len> <token_id> <eid_hex> <uasid> [num_rows] [dim]\n", argv[0]);
         return 1;
     }
 
@@ -36,7 +36,7 @@ int main(int argc, char* argv[])
     memset(&remote_info, 0, sizeof(remote_info));
     remote_info.seg_va = strtoull(argv[1], NULL, 10);
     remote_info.seg_len = strtoull(argv[2], NULL, 10);
-    remote_info.seg_id = (uint32_t)strtoul(argv[3], NULL, 10);
+    remote_info.token_id = (uint32_t)strtoul(argv[3], NULL, 10);
     hex_to_bytes(argv[4], remote_info.eid, sizeof(remote_info.eid));
     remote_info.uasid = (uint32_t)strtoul(argv[5], NULL, 10);
     remote_info.token = URMA_MMAP_DEFAULT_TOKEN;
@@ -44,8 +44,9 @@ int main(int argc, char* argv[])
     int num_rows = (argc > 6) ? atoi(argv[6]) : 10000;
     int dim = (argc > 7) ? atoi(argv[7]) : 341;
 
-    printf("Importing remote segment: va=0x%lx, len=%lu, seg_id=%u\n",
-           remote_info.seg_va, remote_info.seg_len, remote_info.seg_id);
+    printf("Importing remote segment: ubva.va=0x%lx, len=%lu, token_id=%u\n",
+           (unsigned long)remote_info.seg_va, (unsigned long)remote_info.seg_len,
+           remote_info.token_id);
 
     /* Init URMA */
     urma_mmap_ctx_t* ctx = urma_mmap_init(NULL, -1);
