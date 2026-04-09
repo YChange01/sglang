@@ -78,9 +78,11 @@ ubmem_rw_ctx_t* ubmem_rw_init(void)
     ubmem_rw_ctx_t *ctx = (ubmem_rw_ctx_t*)calloc(1, sizeof(*ctx));
     if (!ctx) return NULL;
 
-    /* The SDK is very chatty at INFO. Crank it to ERROR (3) by default.
-     * If caller wants more, they can override by calling
-     * ubsmem_set_logger_level() directly afterwards. */
+    /* The SDK is very chatty at INFO. Crank it to ERROR (3). We set it
+     * twice — once before initialize (in case the logger respects the
+     * level pre-init and suppresses init-time spam) and once after
+     * (in case the logger is only armed inside initialize). Whichever
+     * of the two matters for the installed SDK version, we cover it. */
     (void)ubsmem_set_logger_level(3);
 
     ubsmem_options_t opts;
@@ -94,6 +96,9 @@ ubmem_rw_ctx_t* ubmem_rw_init(void)
         free(ctx);
         return NULL;
     }
+    /* Re-apply log level post-init so subsequent calls are quiet. */
+    (void)ubsmem_set_logger_level(3);
+
     ctx->initialized = true;
     return ctx;
 }

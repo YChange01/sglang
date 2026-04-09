@@ -89,7 +89,15 @@ int main(int argc, char *argv[])
      *    Ignore NOT_FOUND on the deallocate path. */
     (void)ubmem_rw_deallocate(urw, object_name);
 
-    uint64_t alloc_flags = UBMEM_RW_FLAG_CACHE | UBMEM_RW_FLAG_HUGEPAGE;
+    /* For the initial smoke test, use the default 4KB page path
+     * (UBMEM_RW_FLAG_CACHE = 0). Hugepage (UBMEM_RW_FLAG_HUGEPAGE,
+     * 2MB PMD granularity) is better for large (200GB) tables, but
+     * requires 2MB-aligned sizes. Re-enable it once the baseline
+     * works end-to-end:
+     *     alloc_flags |= UBMEM_RW_FLAG_HUGEPAGE;
+     *     total_size = (total_size + (2<<20) - 1) & ~(size_t)((2<<20) - 1);
+     */
+    uint64_t alloc_flags = UBMEM_RW_FLAG_CACHE;
     if (ubmem_rw_allocate(urw, region_name, object_name,
                           total_size, 0644, alloc_flags) != UBMEM_RW_OK) {
         goto fail;
@@ -124,10 +132,12 @@ int main(int argc, char *argv[])
         printf("  sample data[42]     = %.6f (expect %.6f)\n",
                data[42], 42 * 0.001f);
     }
-    if (num_floats > 14322) {
-        /* row 42, col 0 when dim=341: index 42*341 = 14322 */
+    /* Row 42 exists only if num_rows > 42, regardless of dim. This is
+     * the canonical verify row the client reads back. */
+    if (num_rows > 42) {
+        long row42_idx = 42 * dim;
         printf("  sample row[42][0]   = %.6f (expect %.6f)\n",
-               data[42 * dim], (42 * dim) * 0.001f);
+               data[row42_idx], (float)row42_idx * 0.001f);
     }
 
     printf("\nserver ready — waiting for client. Press Ctrl+C to stop.\n");

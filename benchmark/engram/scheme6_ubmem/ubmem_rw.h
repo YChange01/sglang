@@ -34,6 +34,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdbool.h>    /* must precede ubs_mem.h — SDK header forgets it */
+#include <sys/types.h>  /* off_t, mode_t */
 
 #ifdef __cplusplus
 extern "C" {
