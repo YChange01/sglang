@@ -11,7 +11,7 @@
 #   make clean
 
 CC ?= gcc
-CFLAGS = -Wall -Wextra -O2 -fPIC -std=c11
+CFLAGS = -Wall -Wextra -O2 -fPIC -std=c11 -D_GNU_SOURCE
 
 # URMA headers and libraries
 URMA_INCLUDE ?= /usr/include
