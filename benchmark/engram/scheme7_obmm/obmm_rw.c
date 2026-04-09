@@ -98,11 +98,15 @@ int obmm_rw_export(obmm_rw_ctx_t *ctx,
     cmd.va         = va;
     cmd.length     = length;
     cmd.pid        = getpid();
-    cmd.flags      = OBMM_EXPORT_FLAG_ALLOW_MMAP;
-    /* Use NUMA 0 as a concrete, always-present node. Most kernels
-     * validate pxm_numa against `0 <= x < nr_online_nodes` and reject
-     * -1 with EINVAL. If NUMA 0 is wrong for a specific host, the
-     * caller can pass a preallocated handle. */
+    /* Do NOT set OBMM_EXPORT_FLAG_ALLOW_MMAP here. Kernel logs
+     *   "OBMM: ALLOW_MMAP flag is not allowed in export_user_addr."
+     * for the EXPORT_PID path. The flag is meant for the importer
+     * side (who needs the kernel to set up a local VA) — the
+     * exporter already owns the VA, so there's nothing to "allow
+     * mmap" for. Flags = 0 is accepted; FAST bit is optional. */
+    cmd.flags      = 0;
+    /* Use NUMA 0 as a concrete, always-present node. Kernel validates
+     * pxm_numa against `0 <= x < nr_online_nodes` and rejects -1. */
     cmd.pxm_numa   = 0;
     cmd.tokenid    = 0;        /* output field; kernel fills */
     cmd.mem_id     = 0;        /* output field; kernel fills */

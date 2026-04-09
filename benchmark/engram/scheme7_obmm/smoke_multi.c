@@ -78,7 +78,7 @@ static int try_export_pid(int fd, void *va, size_t length,
     struct obmm_cmd_export_pid cmd;
     memset(&cmd, 0, sizeof(cmd));
     cmd.va       = va;
-    cmd.length   = length;
+    cmd.length   = length;     /* EXPORT_PID: length IS byte count */
     cmd.pid      = getpid();
     cmd.flags    = flags;
     cmd.pxm_numa = pxm_numa;
@@ -100,15 +100,28 @@ static int try_export_pid(int fd, void *va, size_t length,
     return 0;
 }
 
-static int try_export_non_pid(int fd, size_t length, int32_t pxm_numa,
+/* OBMM_CMD_EXPORT (non-pid) — kernel allocates.
+ *
+ * Discovered via dmesg:
+ *   "OBMM: Size list is too long: max=16, actual_length=4194304"
+ *
+ * Meaning: cmd.length is NOT the byte count — it's the number of
+ * entries in cmd.size[] (max 16 = OBMM_MAX_LOCAL_NUMA_NODES).
+ * cmd.size[i] is the byte count for NUMA i.
+ *
+ * So to request 4 MB on NUMA 0:
+ *   cmd.length  = 1;             // one size[] entry
+ *   cmd.size[0] = 4*1024*1024;   // 4 MB on NUMA 0
+ */
+static int try_export_non_pid(int fd, size_t byte_count, int32_t pxm_numa,
                               uint64_t flags,
                               const uint8_t seid[16], const uint8_t deid[16],
                               const char *label)
 {
     struct obmm_cmd_export cmd;
     memset(&cmd, 0, sizeof(cmd));
-    cmd.size[0]  = length;     /* ask kernel to allocate from NUMA 0 */
-    cmd.length   = length;
+    cmd.size[0]  = byte_count;   /* bytes to alloc on NUMA 0 */
+    cmd.length   = 1;            /* one valid entry in size[] */
     cmd.flags    = flags;
     cmd.pxm_numa = pxm_numa;
     if (seid) memcpy(cmd.seid, seid, 16);
@@ -147,64 +160,60 @@ int main(void)
     uint8_t eid_fake[16];
     for (int i = 0; i < 16; i++) eid_fake[i] = 0x11 * (i + 1);
 
+    /* Knowledge from the first dmesg run:
+     *   - "ALLOW_MMAP flag is not allowed in export_user_addr"
+     *     → EXPORT_PID must NOT set OBMM_EXPORT_FLAG_ALLOW_MMAP
+     *   - "Size list is too long: max=16, actual_length=4194304"
+     *     → OBMM_CMD_EXPORT.length is the COUNT of size[] entries,
+     *       not a byte count. Helper is already fixed.
+     *
+     * This second pass retries with the corrected semantics. */
     int any_pass = 0;
 
-    /* ========== variant 1: MAP_ANONYMOUS|MAP_SHARED + prefault + pxm=0 + zero eid ========== */
+    /* ========== EXPORT_PID variants (no ALLOW_MMAP) ========== */
+
+    /* v1: baseline with flags=0 */
     {
         void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
                         MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE, -1, 0);
         if (va != MAP_FAILED) {
             prefault(va, LEN);
             any_pass |= try_export_pid(fd, va, LEN, 0,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-                "v1: ANON|SHARED|POPULATE, pxm=0, flags=ALLOW_MMAP, eid=0");
+                0, eid_zero, eid_zero,
+                "v1: EXPORT_PID ANON|SHARED, pxm=0, flags=0, eid=0");
             munmap(va, LEN);
         } else {
             printf("  [SKIP] v1: mmap ANON|SHARED failed: %s\n", strerror(errno));
         }
     }
 
-    /* ========== variant 2: same va, pxm_numa=-1 ========== */
-    {
-        void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
-                        MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE, -1, 0);
-        if (va != MAP_FAILED) {
-            prefault(va, LEN);
-            any_pass |= try_export_pid(fd, va, LEN, -1,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-                "v2: same, pxm=-1");
-            munmap(va, LEN);
-        }
-    }
-
-    /* ========== variant 3: flags = ALLOW_MMAP | FAST ========== */
+    /* v2: same but flags=FAST */
     {
         void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
                         MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE, -1, 0);
         if (va != MAP_FAILED) {
             prefault(va, LEN);
             any_pass |= try_export_pid(fd, va, LEN, 0,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP | OBMM_EXPORT_FLAG_FAST,
-                eid_zero, eid_zero,
-                "v3: same, flags=ALLOW_MMAP|FAST");
+                OBMM_EXPORT_FLAG_FAST, eid_zero, eid_zero,
+                "v2: EXPORT_PID same, flags=FAST");
             munmap(va, LEN);
         }
     }
 
-    /* ========== variant 4: non-zero seid/deid ========== */
+    /* v3: ANON|PRIVATE backing */
     {
         void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
-                        MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE, -1, 0);
+                        MAP_ANONYMOUS|MAP_PRIVATE|MAP_POPULATE, -1, 0);
         if (va != MAP_FAILED) {
             prefault(va, LEN);
             any_pass |= try_export_pid(fd, va, LEN, 0,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_fake, eid_fake,
-                "v4: same, eid=0x11,0x22,... (fake)");
+                0, eid_zero, eid_zero,
+                "v3: EXPORT_PID ANON|PRIVATE, flags=0");
             munmap(va, LEN);
         }
     }
 
-    /* ========== variant 5: memfd_create backing ========== */
+    /* v4: memfd backing */
     {
         int mfd = sys_memfd_create("obmm_smoke", MFD_CLOEXEC);
         if (mfd >= 0) {
@@ -214,77 +223,73 @@ int main(void)
                 if (va != MAP_FAILED) {
                     prefault(va, LEN);
                     any_pass |= try_export_pid(fd, va, LEN, 0,
-                        OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-                        "v5: memfd_create backing, pxm=0");
+                        0, eid_zero, eid_zero,
+                        "v4: EXPORT_PID memfd backing, flags=0");
                     munmap(va, LEN);
-                } else {
-                    printf("  [SKIP] v5: mmap(memfd) failed: %s\n", strerror(errno));
                 }
-            } else {
-                printf("  [SKIP] v5: ftruncate(memfd) failed: %s\n", strerror(errno));
             }
             close(mfd);
-        } else {
-            printf("  [SKIP] v5: memfd_create failed: %s\n", strerror(errno));
         }
     }
 
-    /* ========== variant 6: MAP_PRIVATE instead of MAP_SHARED ========== */
-    {
-        void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
-                        MAP_ANONYMOUS|MAP_PRIVATE|MAP_POPULATE, -1, 0);
-        if (va != MAP_FAILED) {
-            prefault(va, LEN);
-            any_pass |= try_export_pid(fd, va, LEN, 0,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-                "v6: ANON|PRIVATE|POPULATE");
-            munmap(va, LEN);
-        }
-    }
-
-    /* ========== variant 7: mlocked anonymous ========== */
+    /* v5: MAP_LOCKED */
     {
         void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
                         MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE|MAP_LOCKED, -1, 0);
         if (va != MAP_FAILED) {
             prefault(va, LEN);
             any_pass |= try_export_pid(fd, va, LEN, 0,
-                OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-                "v7: same + MAP_LOCKED");
+                0, eid_zero, eid_zero,
+                "v5: EXPORT_PID + MAP_LOCKED, flags=0");
             munmap(va, LEN);
         } else {
-            printf("  [SKIP] v7: mmap(MAP_LOCKED) failed: %s\n", strerror(errno));
+            printf("  [SKIP] v5: mmap(MAP_LOCKED) failed: %s\n", strerror(errno));
         }
     }
 
-    /* ========== variant 8: OBMM_CMD_EXPORT (non-pid), size[0]=LEN, pxm=0, eid=0 ========== */
+    /* v6: 2MB-aligned (obmm allocator granularity per sysfs) */
     {
-        any_pass |= try_export_non_pid(fd, LEN, 0,
-            OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-            "v8: OBMM_CMD_EXPORT (non-pid), size[0]=LEN, pxm=0, eid=0");
+        void *va = mmap(NULL, LEN, PROT_READ|PROT_WRITE,
+                        MAP_ANONYMOUS|MAP_SHARED|MAP_POPULATE|MAP_HUGETLB,
+                        -1, 0);
+        if (va != MAP_FAILED) {
+            prefault(va, LEN);
+            any_pass |= try_export_pid(fd, va, LEN, 0,
+                0, eid_zero, eid_zero,
+                "v6: EXPORT_PID + MAP_HUGETLB (2MB pages)");
+            munmap(va, LEN);
+        } else {
+            printf("  [SKIP] v6: mmap(MAP_HUGETLB) failed: %s (nr_hugepages?)\n",
+                   strerror(errno));
+        }
     }
 
-    /* ========== variant 9: OBMM_CMD_EXPORT, pxm=-1 ========== */
-    {
-        any_pass |= try_export_non_pid(fd, LEN, -1,
-            OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
-            "v9: OBMM_CMD_EXPORT, pxm=-1");
-    }
+    /* ========== OBMM_CMD_EXPORT variants (kernel allocates) ========== */
 
-    /* ========== variant 10: OBMM_CMD_EXPORT, fake eid, pxm=0 ========== */
-    {
-        any_pass |= try_export_non_pid(fd, LEN, 0,
-            OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_fake, eid_fake,
-            "v10: OBMM_CMD_EXPORT, fake eid");
-    }
+    /* v7: baseline — 4 MB on NUMA 0, flags=0 */
+    any_pass |= try_export_non_pid(fd, LEN, 0, 0, eid_zero, eid_zero,
+        "v7: EXPORT size[0]=4MB, pxm=0, flags=0, eid=0");
 
-    /* ========== variant 11: OBMM_CMD_EXPORT, flags=ALLOW_MMAP|FAST ========== */
-    {
-        any_pass |= try_export_non_pid(fd, LEN, 0,
-            OBMM_EXPORT_FLAG_ALLOW_MMAP | OBMM_EXPORT_FLAG_FAST,
-            eid_zero, eid_zero,
-            "v11: OBMM_CMD_EXPORT, flags=ALLOW_MMAP|FAST");
-    }
+    /* v8: with ALLOW_MMAP (should work — kernel is the allocator) */
+    any_pass |= try_export_non_pid(fd, LEN, 0,
+        OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_zero, eid_zero,
+        "v8: EXPORT size[0]=4MB, flags=ALLOW_MMAP");
+
+    /* v9: with FAST */
+    any_pass |= try_export_non_pid(fd, LEN, 0,
+        OBMM_EXPORT_FLAG_FAST, eid_zero, eid_zero,
+        "v9: EXPORT size[0]=4MB, flags=FAST");
+
+    /* v10: ALLOW_MMAP|FAST */
+    any_pass |= try_export_non_pid(fd, LEN, 0,
+        OBMM_EXPORT_FLAG_ALLOW_MMAP | OBMM_EXPORT_FLAG_FAST,
+        eid_zero, eid_zero,
+        "v10: EXPORT size[0]=4MB, flags=ALLOW_MMAP|FAST");
+
+    /* v11: fake eid */
+    any_pass |= try_export_non_pid(fd, LEN, 0,
+        OBMM_EXPORT_FLAG_ALLOW_MMAP, eid_fake, eid_fake,
+        "v11: EXPORT flags=ALLOW_MMAP, fake eid");
 
     printf("\n");
     if (any_pass) {
