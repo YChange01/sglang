@@ -7,10 +7,10 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdatomic.h>
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
-#include <malloc.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -18,8 +18,10 @@
 #include <ub/umdk/urma/urma_api.h>
 #include <ub/umdk/urma/urma_opcode.h>
 
+#ifndef PAGE_SIZE
 #define PAGE_SIZE 4096
-#define JETTY_DEPTH 256
+#endif
+#define JETTY_DEPTH 8192  /* > URMA_RW_MAX_BATCH(4096) for headroom */
 #define MAX_POLL_TRY 1000000       /* ~1 second with 1us sleep */
 #define DEFAULT_TOKEN 0xACFE
 
@@ -67,6 +69,13 @@ struct urma_rw_ctx {
     urma_token_t   token;
     uint64_t       rid;  /* request id counter */
 
+    /* Pre-allocated batch buffers (heap, not stack — DMA-safe) */
+    urma_sge_t*    batch_src_sges;
+    urma_sge_t*    batch_dst_sges;
+    urma_sg_t*     batch_src_sgs;
+    urma_sg_t*     batch_dst_sgs;
+    urma_jfs_wr_t* batch_wrs;
+
     int listen_fd;
     int client_fd;
     bool is_server;
@@ -77,15 +86,28 @@ struct urma_rw_ctx {
 /*  Initialization                                                     */
 /* ================================================================== */
 
+/* Process-global URMA refcount (urma_init/uninit are ref-counted globally) */
+static atomic_int g_urma_refcount = 0;
+
 static int do_urma_init(void)
 {
-    urma_init_attr_t attr = {0};
-    urma_status_t rc = urma_init(&attr);
-    if (rc != URMA_SUCCESS) {
-        LOG_ERR("urma_init failed: %d", rc);
-        return -1;
+    if (atomic_fetch_add(&g_urma_refcount, 1) == 0) {
+        urma_init_attr_t attr = {0};
+        urma_status_t rc = urma_init(&attr);
+        if (rc != URMA_SUCCESS) {
+            LOG_ERR("urma_init failed: %d", rc);
+            atomic_fetch_sub(&g_urma_refcount, 1);
+            return -1;
+        }
     }
     return 0;
+}
+
+static void do_urma_uninit(void)
+{
+    if (atomic_fetch_sub(&g_urma_refcount, 1) == 1) {
+        urma_uninit();
+    }
 }
 
 urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
@@ -204,13 +226,26 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
         goto DEL_JFR;
     }
 
-    /* Allocate and register memory */
-    ctx->buf = memalign(PAGE_SIZE, buf_size);
-    if (!ctx->buf) {
-        LOG_ERR("memalign %lu bytes failed", (unsigned long)buf_size);
+    /* Allocate and register memory (page-aligned) */
+    if (posix_memalign(&ctx->buf, PAGE_SIZE, buf_size) != 0 || !ctx->buf) {
+        LOG_ERR("posix_memalign %lu bytes failed: %s",
+                (unsigned long)buf_size, strerror(errno));
+        ctx->buf = NULL;
         goto DEL_JETTY;
     }
     memset(ctx->buf, 0, buf_size);
+
+    /* Pre-allocate heap-based batch work buffers (DMA-safe, not on stack) */
+    ctx->batch_src_sges = calloc(URMA_RW_MAX_BATCH, sizeof(urma_sge_t));
+    ctx->batch_dst_sges = calloc(URMA_RW_MAX_BATCH, sizeof(urma_sge_t));
+    ctx->batch_src_sgs  = calloc(URMA_RW_MAX_BATCH, sizeof(urma_sg_t));
+    ctx->batch_dst_sgs  = calloc(URMA_RW_MAX_BATCH, sizeof(urma_sg_t));
+    ctx->batch_wrs      = calloc(URMA_RW_MAX_BATCH, sizeof(urma_jfs_wr_t));
+    if (!ctx->batch_src_sges || !ctx->batch_dst_sges ||
+        !ctx->batch_src_sgs || !ctx->batch_dst_sgs || !ctx->batch_wrs) {
+        LOG_ERR("Failed to allocate batch work buffers");
+        goto FREE_BUF;
+    }
 
     urma_reg_seg_flag_t reg_flag = {
         .bs.token_policy = URMA_TOKEN_NONE,
@@ -252,7 +287,7 @@ DEL_JFCE:
 DEL_CTX:
     urma_delete_context(ctx->urma_ctx);
 UNINIT:
-    urma_uninit();
+    do_urma_uninit();
 FREE_CTX:
     free(ctx);
     return NULL;
@@ -262,19 +297,32 @@ void urma_rw_destroy(urma_rw_ctx_t* ctx)
 {
     if (!ctx) return;
 
+    /* Close sockets first — independent of URMA */
     if (ctx->client_fd >= 0) close(ctx->client_fd);
     if (ctx->listen_fd >= 0) close(ctx->listen_fd);
 
+    /* Teardown order: destroy active objects before unregistering / freeing memory.
+     * Jetty/JFR/JFC hold references to the JFC/JFCE hierarchy and may have
+     * pending DMA operations — must be destroyed before freeing the buffer. */
     if (ctx->remote_tjetty) urma_unimport_jetty(ctx->remote_tjetty);
-    if (ctx->remote_tseg) urma_unimport_seg(ctx->remote_tseg);
-    if (ctx->local_tseg) urma_unregister_seg(ctx->local_tseg);
-    if (ctx->buf) free(ctx->buf);
     if (ctx->jetty) urma_delete_jetty(ctx->jetty);
     if (ctx->jfr) urma_delete_jfr(ctx->jfr);
     if (ctx->jfc) urma_delete_jfc(ctx->jfc);
     if (ctx->jfce) urma_delete_jfce(ctx->jfce);
+    if (ctx->remote_tseg) urma_unimport_seg(ctx->remote_tseg);
+    if (ctx->local_tseg) urma_unregister_seg(ctx->local_tseg);
+    /* Now safe to free buffer — no in-flight DMA to it */
+    if (ctx->buf) free(ctx->buf);
+
+    /* Batch work buffers (heap) */
+    free(ctx->batch_src_sges);
+    free(ctx->batch_dst_sges);
+    free(ctx->batch_src_sgs);
+    free(ctx->batch_dst_sgs);
+    free(ctx->batch_wrs);
+
     if (ctx->urma_ctx) urma_delete_context(ctx->urma_ctx);
-    urma_uninit();
+    do_urma_uninit();
     free(ctx);
 }
 
@@ -288,21 +336,32 @@ void* urma_rw_get_buffer(urma_rw_ctx_t* ctx)
 /*  TCP seg/jetty info exchange                                        */
 /* ================================================================== */
 
-static int sock_sync(int fd, int size, char* local, char* remote)
+static int sock_send_all(int fd, const void* buf, size_t size)
 {
-    ssize_t w = write(fd, local, size);
-    if (w < size) {
-        LOG_ERR("sock_sync write: %s", strerror(errno));
-        return -1;
-    }
-    int total = 0;
-    while (total < size) {
-        ssize_t r = read(fd, remote + total, size - total);
-        if (r <= 0) {
-            LOG_ERR("sock_sync read: %s", strerror(errno));
+    const char* p = (const char*)buf;
+    size_t done = 0;
+    while (done < size) {
+        ssize_t w = write(fd, p + done, size - done);
+        if (w <= 0) {
+            LOG_ERR("sock_send_all: %s", strerror(errno));
             return -1;
         }
-        total += r;
+        done += w;
+    }
+    return 0;
+}
+
+static int sock_recv_all(int fd, void* buf, size_t size)
+{
+    char* p = (char*)buf;
+    size_t done = 0;
+    while (done < size) {
+        ssize_t r = read(fd, p + done, size - done);
+        if (r <= 0) {
+            LOG_ERR("sock_recv_all: %s", strerror(errno));
+            return -1;
+        }
+        done += r;
     }
     return 0;
 }
@@ -384,10 +443,14 @@ int urma_rw_server_accept(urma_rw_ctx_t* ctx, uint16_t port)
     };
     if (bind(ctx->listen_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         LOG_ERR("bind port %u: %s", port, strerror(errno));
+        close(ctx->listen_fd);
+        ctx->listen_fd = -1;
         return URMA_RW_ERR_SOCKET;
     }
     if (listen(ctx->listen_fd, 1) < 0) {
         LOG_ERR("listen: %s", strerror(errno));
+        close(ctx->listen_fd);
+        ctx->listen_fd = -1;
         return URMA_RW_ERR_SOCKET;
     }
 
@@ -399,10 +462,14 @@ int urma_rw_server_accept(urma_rw_ctx_t* ctx, uint16_t port)
     }
     LOG_INFO("Client connected");
 
-    /* Exchange info */
+    /* Half-duplex exchange: server receives first, then sends.
+     * Client does the opposite — no deadlock even with zero buffer. */
     seg_jetty_info_t local, remote;
     pack_info(&local, ctx);
-    if (sock_sync(ctx->client_fd, sizeof(local), (char*)&local, (char*)&remote) != 0) {
+    if (sock_recv_all(ctx->client_fd, &remote, sizeof(remote)) != 0) {
+        return URMA_RW_ERR_SOCKET;
+    }
+    if (sock_send_all(ctx->client_fd, &local, sizeof(local)) != 0) {
         return URMA_RW_ERR_SOCKET;
     }
 
@@ -413,9 +480,12 @@ int urma_rw_server_accept(urma_rw_ctx_t* ctx, uint16_t port)
         return URMA_RW_ERR_IMPORT;
     }
 
-    /* Final sync */
-    char sync_msg = 0;
-    sock_sync(ctx->client_fd, 1, "S", &sync_msg);
+    /* Final sync: server receives then sends one ready byte */
+    char byte_in = 0;
+    if (sock_recv_all(ctx->client_fd, &byte_in, 1) != 0 ||
+        sock_send_all(ctx->client_fd, "R", 1) != 0) {
+        return URMA_RW_ERR_SOCKET;
+    }
 
     ctx->is_server = true;
     LOG_INFO("Server ready — data is accessible to client");
@@ -443,10 +513,14 @@ int urma_rw_client_connect(urma_rw_ctx_t* ctx, const char* server_ip, uint16_t p
         return URMA_RW_ERR_SOCKET;
     }
 
-    /* Exchange info */
+    /* Half-duplex exchange: client sends first, then receives.
+     * Server does the opposite — no deadlock. */
     seg_jetty_info_t local, remote;
     pack_info(&local, ctx);
-    if (sock_sync(ctx->client_fd, sizeof(local), (char*)&local, (char*)&remote) != 0) {
+    if (sock_send_all(ctx->client_fd, &local, sizeof(local)) != 0) {
+        return URMA_RW_ERR_SOCKET;
+    }
+    if (sock_recv_all(ctx->client_fd, &remote, sizeof(remote)) != 0) {
         return URMA_RW_ERR_SOCKET;
     }
 
@@ -454,9 +528,12 @@ int urma_rw_client_connect(urma_rw_ctx_t* ctx, const char* server_ip, uint16_t p
         return URMA_RW_ERR_IMPORT;
     }
 
-    /* Final sync */
-    char sync_msg = 0;
-    sock_sync(ctx->client_fd, 1, "S", &sync_msg);
+    /* Final sync: client sends then receives ready byte */
+    char byte_in = 0;
+    if (sock_send_all(ctx->client_fd, "R", 1) != 0 ||
+        sock_recv_all(ctx->client_fd, &byte_in, 1) != 0) {
+        return URMA_RW_ERR_SOCKET;
+    }
 
     ctx->is_server = false;
     LOG_INFO("Client ready — can now urma_read from remote");
@@ -481,6 +558,11 @@ static int poll_completion(urma_rw_ctx_t* ctx, uint64_t expected_rid)
             if (cr.status != URMA_CR_SUCCESS) {
                 LOG_ERR("CR failed: status=%d, rid=%lu",
                         cr.status, (unsigned long)cr.user_ctx);
+                return -1;
+            }
+            if ((uint64_t)cr.user_ctx != expected_rid) {
+                LOG_ERR("Unexpected rid: got %lu, want %lu",
+                        (unsigned long)cr.user_ctx, (unsigned long)expected_rid);
                 return -1;
             }
             return 0;
@@ -518,7 +600,15 @@ static int poll_n_completions(urma_rw_ctx_t* ctx, uint32_t n)
 int urma_rw_read(urma_rw_ctx_t* ctx, uint64_t local_offset,
                  uint64_t remote_offset, uint32_t len)
 {
-    if (!ctx || !ctx->remote_tseg || !ctx->remote_tjetty) {
+    if (!ctx || !ctx->remote_tseg || !ctx->remote_tjetty || len == 0) {
+        return URMA_RW_ERR_PARAM;
+    }
+    if (local_offset + len > ctx->buf_size ||
+        remote_offset + len > ctx->remote_tseg->seg.len) {
+        LOG_ERR("read out of bounds: local=%lu+%u (buf=%lu), remote=%lu+%u (rseg=%lu)",
+                (unsigned long)local_offset, len, (unsigned long)ctx->buf_size,
+                (unsigned long)remote_offset, len,
+                (unsigned long)ctx->remote_tseg->seg.len);
         return URMA_RW_ERR_PARAM;
     }
 
@@ -569,13 +659,30 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
         count > URMA_RW_MAX_BATCH) {
         return URMA_RW_ERR_PARAM;
     }
+    if (!ctx->remote_tseg || !ctx->remote_tjetty) {
+        return URMA_RW_ERR_PARAM;
+    }
 
-    /* Submit all WRs first (chained) */
-    urma_sge_t  src_sges[URMA_RW_MAX_BATCH];
-    urma_sge_t  dst_sges[URMA_RW_MAX_BATCH];
-    urma_sg_t   src_sgs[URMA_RW_MAX_BATCH];
-    urma_sg_t   dst_sgs[URMA_RW_MAX_BATCH];
-    urma_jfs_wr_t wrs[URMA_RW_MAX_BATCH];
+    /* Bounds-check all offsets */
+    uint64_t remote_len = ctx->remote_tseg->seg.len;
+    for (uint32_t i = 0; i < count; i++) {
+        if (local_offsets[i] + lens[i] > ctx->buf_size ||
+            remote_offsets[i] + lens[i] > remote_len) {
+            LOG_ERR("batch[%u] out of bounds: local=%lu+%u (buf=%lu), remote=%lu+%u (rseg=%lu)",
+                    i, (unsigned long)local_offsets[i], lens[i],
+                    (unsigned long)ctx->buf_size,
+                    (unsigned long)remote_offsets[i], lens[i],
+                    (unsigned long)remote_len);
+            return URMA_RW_ERR_PARAM;
+        }
+    }
+
+    /* Use pre-allocated heap buffers (DMA-safe) */
+    urma_sge_t* src_sges = ctx->batch_src_sges;
+    urma_sge_t* dst_sges = ctx->batch_dst_sges;
+    urma_sg_t*  src_sgs  = ctx->batch_src_sgs;
+    urma_sg_t*  dst_sgs  = ctx->batch_dst_sgs;
+    urma_jfs_wr_t* wrs   = ctx->batch_wrs;
 
     for (uint32_t i = 0; i < count; i++) {
         src_sges[i].addr = ctx->remote_tseg->seg.ubva.va + remote_offsets[i];
@@ -593,7 +700,9 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
 
         wrs[i].opcode = URMA_OPC_READ;
         wrs[i].flag.value = 0;
-        wrs[i].flag.bs.complete_enable = 1;
+        /* Only enable completion on the last WR in the chain — one completion
+         * per batch, avoiding hardware coalescing ambiguity. */
+        wrs[i].flag.bs.complete_enable = (i == count - 1) ? 1 : 0;
         wrs[i].tjetty = ctx->remote_tjetty;
         wrs[i].user_ctx = __atomic_fetch_add(&ctx->rid, 1, __ATOMIC_RELAXED);
         wrs[i].rw.src = src_sgs[i];
@@ -607,5 +716,24 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
         return URMA_RW_ERR_POST;
     }
 
-    return poll_n_completions(ctx, count);
+    /* Wait for the single completion (only the last WR had complete_enable=1) */
+    urma_cr_t cr = {0};
+    int tries = 0;
+    while (tries < MAX_POLL_TRY) {
+        int got = urma_poll_jfc(ctx->jfc, 1, &cr);
+        if (got < 0) {
+            LOG_ERR("urma_poll_jfc: %d", got);
+            return URMA_RW_ERR_POLL;
+        }
+        if (got > 0) {
+            if (cr.status != URMA_CR_SUCCESS) {
+                LOG_ERR("batch CR failed: status=%d", cr.status);
+                return URMA_RW_ERR_POLL;
+            }
+            return URMA_RW_OK;
+        }
+        tries++;
+    }
+    LOG_ERR("batch completion timeout");
+    return URMA_RW_ERR_POLL;
 }

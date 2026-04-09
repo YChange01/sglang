@@ -15,7 +15,7 @@
 #include <signal.h>
 #include <time.h>
 
-static volatile int g_stop = 0;
+static volatile sig_atomic_t g_stop = 0;
 
 static void sigint_handler(int sig)
 {

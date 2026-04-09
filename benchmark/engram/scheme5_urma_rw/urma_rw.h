@@ -41,8 +41,9 @@ extern "C" {
 /* Default TCP port for seg info exchange */
 #define URMA_RW_DEFAULT_PORT 13857
 
-/* Max outstanding read requests in one batch */
-#define URMA_RW_MAX_BATCH 256
+/* Max outstanding read requests in one batch.
+ * Sized for Engram: 12 tables × 256 tokens = 3072 reads. */
+#define URMA_RW_MAX_BATCH 4096
 
 /* Opaque context handle */
 typedef struct urma_rw_ctx urma_rw_ctx_t;

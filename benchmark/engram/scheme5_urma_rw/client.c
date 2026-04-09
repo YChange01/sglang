@@ -107,14 +107,24 @@ static void bench_engram_prefetch(urma_rw_ctx_t* ctx, int num_rows, int dim,
     printf("  %-8s %-10s %-10s %-12s\n", "Tokens", "Data", "Avg ms", "Throughput");
     printf("  --------------------------------------------\n");
 
+    /* Heap-allocated, reused across batch sizes */
+    uint64_t* locals = malloc(URMA_RW_MAX_BATCH * sizeof(uint64_t));
+    uint64_t* remotes = malloc(URMA_RW_MAX_BATCH * sizeof(uint64_t));
+    uint32_t* lens = malloc(URMA_RW_MAX_BATCH * sizeof(uint32_t));
+    if (!locals || !remotes || !lens) {
+        fprintf(stderr, "malloc failed\n");
+        goto cleanup;
+    }
+
     for (int b = 0; b < 4; b++) {
         int tokens = batch_sizes[b];
         int total_reads = NUM_TABLES * tokens;
-        if (total_reads > URMA_RW_MAX_BATCH) continue;
+        if (total_reads > URMA_RW_MAX_BATCH) {
+            printf("  %-8d  (skipped: %d > URMA_RW_MAX_BATCH=%d)\n",
+                   tokens, total_reads, URMA_RW_MAX_BATCH);
+            continue;
+        }
 
-        uint64_t locals[URMA_RW_MAX_BATCH];
-        uint64_t remotes[URMA_RW_MAX_BATCH];
-        uint32_t lens[URMA_RW_MAX_BATCH];
         for (int i = 0; i < total_reads; i++) lens[i] = row_bytes;
 
         struct timespec t0, t1;
@@ -127,7 +137,10 @@ static void bench_engram_prefetch(urma_rw_ctx_t* ctx, int num_rows, int dim,
                 remotes[i] = (uint64_t)row * row_bytes;
             }
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            urma_rw_read_batch(ctx, locals, remotes, lens, total_reads);
+            if (urma_rw_read_batch(ctx, locals, remotes, lens, total_reads) != 0) {
+                fprintf(stderr, "batch read failed at tokens=%d\n", tokens);
+                break;
+            }
             clock_gettime(CLOCK_MONOTONIC, &t1);
             total_us += diff_us(&t0, &t1);
         }
@@ -138,6 +151,11 @@ static void bench_engram_prefetch(urma_rw_ctx_t* ctx, int num_rows, int dim,
         printf("  %-8d %-8.1fKB %-9.2f %.1f MB/s\n",
                tokens, data_kb, avg_ms, throughput);
     }
+
+cleanup:
+    free(locals);
+    free(remotes);
+    free(lens);
 }
 
 static void verify_read(urma_rw_ctx_t* ctx, int dim)
@@ -173,9 +191,11 @@ int main(int argc, char* argv[])
     int dim = (argc > 4) ? atoi(argv[4]) : 341;
     int num_iters = (argc > 5) ? atoi(argv[5]) : 200;
 
-    /* Local buffer just needs enough to hold biggest batch result */
-    uint64_t local_size = URMA_RW_MAX_BATCH * dim * sizeof(float);
-    if (local_size < 16 * 1024 * 1024) local_size = 16 * 1024 * 1024;
+    /* Local buffer: enough for the biggest batch (URMA_RW_MAX_BATCH rows).
+     * With URMA_RW_MAX_BATCH=4096 and dim=341: ~5.5 MB minimum.
+     * Use 64 MB for headroom. */
+    uint64_t local_size = (uint64_t)URMA_RW_MAX_BATCH * dim * sizeof(float);
+    if (local_size < 64 * 1024 * 1024) local_size = 64 * 1024 * 1024;
 
     printf("=== URMA RW Client ===\n");
     printf("Server: %s:%u\n", server_ip, port);
