@@ -23,17 +23,22 @@ LDFLAGS  =
 LIB_SRCS = obmm_rw.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
-BINS = smoke_test
+BINS = smoke_test smoke_multi
 
 .PHONY: all clean help
 
 all: $(BINS)
 	@echo
 	@echo "Built: $(BINS)"
-	@echo "Next:  ./smoke_test"
+	@echo "Next:  sudo ./smoke_test        # single configuration"
+	@echo "       sudo ./smoke_multi       # 11 variants to diagnose EINVAL"
 
 smoke_test: smoke_test.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_test.c $(LIB_OBJS) $(LDFLAGS)
+	@echo "Built $@"
+
+smoke_multi: smoke_multi.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_multi.c $(LIB_OBJS) $(LDFLAGS)
 	@echo "Built $@"
 
 %.o: %.c obmm_rw.h
