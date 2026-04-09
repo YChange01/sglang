@@ -162,25 +162,34 @@ int ubmem_rw_query_cluster(ubmem_rw_ctx_t *ctx, ubmem_rw_cluster_t *out)
     /* (3) try to find which entry corresponds to the local node.
      * The SDK doesn't expose a direct "which host am I" call, so we
      * fall back to comparing gethostname() against the reported names. */
-    char myhost[UBMEM_RW_MAX_HOSTNAME] = {0};
+    char myhost[UBMEM_RW_MAX_HOSTNAME];
+    memset(myhost, 0, sizeof(myhost));
     if (gethostname(myhost, sizeof(myhost) - 1) == 0) {
-        /* Some clusters report FQDN; truncate at the first dot for a
-         * lenient match ("node1" == "node1.cluster.local"). */
+        /* POSIX doesn't strictly require NUL-termination on truncation;
+         * glibc does, but be defensive. */
+        myhost[sizeof(myhost) - 1] = '\0';
+
+        /* Exact match first. */
         for (int h = 0; h < nh; h++) {
             if (strcmp(out->hostnames[h], myhost) == 0) {
                 out->local_host_idx = h;
                 break;
             }
         }
+        /* Lenient FQDN fallback: "node1" matches "node1.cluster.local"
+         * in either direction. Only meaningful for a non-empty short
+         * name, otherwise strncmp(_, _, 0) would match everything. */
         if (out->local_host_idx < 0) {
             const char *dot = strchr(myhost, '.');
             size_t plain_len = dot ? (size_t)(dot - myhost) : strlen(myhost);
-            for (int h = 0; h < nh; h++) {
-                if (strncmp(out->hostnames[h], myhost, plain_len) == 0 &&
-                    (out->hostnames[h][plain_len] == '\0' ||
-                     out->hostnames[h][plain_len] == '.')) {
-                    out->local_host_idx = h;
-                    break;
+            if (plain_len > 0) {
+                for (int h = 0; h < nh; h++) {
+                    if (strncmp(out->hostnames[h], myhost, plain_len) == 0 &&
+                        (out->hostnames[h][plain_len] == '\0' ||
+                         out->hostnames[h][plain_len] == '.')) {
+                        out->local_host_idx = h;
+                        break;
+                    }
                 }
             }
         }

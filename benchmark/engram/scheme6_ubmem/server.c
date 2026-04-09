@@ -111,14 +111,26 @@ int main(int argc, char *argv[])
     /* 3. Destroy any stale "engram_pool" region from a previous run
      *    that may have been created with wrong hostnames. This is a
      *    bench tool, not a production service — flushing per-run is
-     *    the right behavior. Wrapper treats NOT_FOUND as success, and
-     *    IN_USING is logged but non-fatal so we still try to proceed. */
+     *    the right behavior. Wrapper treats NOT_FOUND as success.
+     *
+     *    MUST fail hard on any other error: SDK's create_region on an
+     *    existing region is "ignore new attrs, return ALREADY_EXIST",
+     *    so if destroy fails we'd silently end up reusing the stale
+     *    region with the wrong hostnames — exactly the bug we're
+     *    trying to fix. */
     printf("  destroying stale region \"%s\" (idempotent) ...\n", region_name);
     int drc = ubmem_rw_destroy_region(urw, region_name);
     if (drc != UBMEM_RW_OK) {
         fprintf(stderr,
-                "  (region destroy returned rc=%d — continuing, may be in use)\n",
-                drc);
+                "  [FATAL] destroy_region rc=%d (%s) — can't guarantee a clean "
+                "region. Likely causes:\n"
+                "    - another process has the region mapped (check clients)\n"
+                "    - permission denied (run as the same user as ubsmd)\n"
+                "    - IPC / network issue talking to ubsmd\n"
+                "  Try:  systemctl restart ubsmd  (on BOTH nodes), then rerun.\n"
+                "  Or:   pass a fresh region name as argv[3].\n",
+                drc, ubmem_rw_strerror(drc));
+        goto fail;
     }
 
     /* 4. Create it fresh with the REAL cluster hostnames. */
