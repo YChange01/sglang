@@ -16,17 +16,30 @@ UBSM_PREFIX ?= /usr/local/ubs_mem
 
 CC       ?= gcc
 CFLAGS    = -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE -fPIC
-INCLUDES  = -I$(UBSM_PREFIX)/include
+INCLUDES  = -I$(UBSM_PREFIX)/include -I.
 LDFLAGS   = -L$(UBSM_PREFIX)/lib -lubsm_sdk \
             -Wl,-rpath,$(UBSM_PREFIX)/lib
 
 .PHONY: all clean
 
-all: ubsm_probe
+all: ubsm_probe server client
+
+# The wrapper library source — both server and client link it statically
+# via the per-target compilation below.
+WRAPPER_SRC = ubmem_rw.c
+WRAPPER_HDR = ubmem_rw.h
 
 ubsm_probe: ubsm_probe.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 	@echo "Built $@"
 
+server: server.c $(WRAPPER_SRC) $(WRAPPER_HDR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ server.c $(WRAPPER_SRC) $(LDFLAGS)
+	@echo "Built $@"
+
+client: client.c $(WRAPPER_SRC) $(WRAPPER_HDR)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ client.c $(WRAPPER_SRC) $(LDFLAGS)
+	@echo "Built $@"
+
 clean:
-	rm -f ubsm_probe *.o
+	rm -f ubsm_probe server client *.o
