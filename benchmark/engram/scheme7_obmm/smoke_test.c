@@ -80,17 +80,31 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    /* 2. allocate. MAP_SHARED so the kernel can pin / export these pages.
-     *    MAP_ANONYMOUS + -1 fd gives us cacheable normal pages. */
+    /* 2. allocate. MAP_SHARED + MAP_ANONYMOUS creates a tmpfs-backed
+     *    mapping. MAP_POPULATE forces the kernel to prefault all pages
+     *    at mmap time — obmm EXPORT_PID walks the caller's page tables
+     *    and almost certainly rejects COW-zero pages with EINVAL. */
     void *va = mmap(NULL, length, PROT_READ | PROT_WRITE,
-                    MAP_ANONYMOUS | MAP_SHARED, -1, 0);
+                    MAP_ANONYMOUS | MAP_SHARED | MAP_POPULATE, -1, 0);
     if (va == MAP_FAILED) {
         fprintf(stderr, "FATAL: mmap failed: %s\n", strerror(errno));
         goto fail_close;
     }
-    printf("  allocated va = %p\n", va);
+    printf("  allocated va = %p (MAP_POPULATE)\n", va);
 
-    /* 3. fill pattern. We only need to touch the first KB to prove the
+    /* 3. Belt-and-suspenders prefault: explicitly touch every 4 KB
+     *    page to make sure each one has a real physical frame, not a
+     *    COW-zero placeholder. MAP_POPULATE should already do this but
+     *    on some kernels it's a hint rather than a guarantee. */
+    {
+        volatile uint8_t *bytes = (volatile uint8_t*)va;
+        for (size_t i = 0; i < length; i += 4096) {
+            bytes[i] = 0;
+        }
+        printf("  prefaulted %zu pages (4KB each)\n", length / 4096);
+    }
+
+    /* 4. fill pattern. We only need to touch the first KB to prove the
      *    import path works; full fill is useful for a later bench. */
     size_t n_pattern_words = 1024 / sizeof(uint32_t);  /* 256 words = 1 KB */
     volatile uint32_t *words = (volatile uint32_t*)va;

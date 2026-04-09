@@ -99,7 +99,11 @@ int obmm_rw_export(obmm_rw_ctx_t *ctx,
     cmd.length     = length;
     cmd.pid        = getpid();
     cmd.flags      = OBMM_EXPORT_FLAG_ALLOW_MMAP;
-    cmd.pxm_numa   = -1;       /* signed s32; -1 == UINT32_MAX bit pattern == "any" */
+    /* Use NUMA 0 as a concrete, always-present node. Most kernels
+     * validate pxm_numa against `0 <= x < nr_online_nodes` and reject
+     * -1 with EINVAL. If NUMA 0 is wrong for a specific host, the
+     * caller can pass a preallocated handle. */
+    cmd.pxm_numa   = 0;
     cmd.tokenid    = 0;        /* output field; kernel fills */
     cmd.mem_id     = 0;        /* output field; kernel fills */
     cmd.uba        = 0;        /* output field; kernel fills */
@@ -111,13 +115,32 @@ int obmm_rw_export(obmm_rw_ctx_t *ctx,
     if (seid) memcpy(cmd.seid, seid, 16);
     if (deid) memcpy(cmd.deid, deid, 16);
 
-    LOG_INFO("ioctl EXPORT_PID: va=%p length=%zu pid=%d flags=0x%lx pxm_numa=%d",
-             va, length, (int)cmd.pid, (unsigned long)cmd.flags,
-             (int)cmd.pxm_numa);
+    /* Dump EVERY field we're about to send so a failure gives us
+     * immediate ground truth without needing strace. */
+    LOG_INFO("ioctl EXPORT_PID parameters:");
+    LOG_INFO("  va         = %p", cmd.va);
+    LOG_INFO("  length     = %lu (0x%lx)",
+             (unsigned long)cmd.length, (unsigned long)cmd.length);
+    LOG_INFO("  flags      = 0x%lx", (unsigned long)cmd.flags);
+    LOG_INFO("  uba        = 0x%lx (in)", (unsigned long)cmd.uba);
+    LOG_INFO("  mem_id     = 0x%lx (in)", (unsigned long)cmd.mem_id);
+    LOG_INFO("  tokenid    = 0x%x (in)", (unsigned)cmd.tokenid);
+    LOG_INFO("  pid        = %d", (int)cmd.pid);
+    LOG_INFO("  pxm_numa   = %d", (int)cmd.pxm_numa);
+    LOG_INFO("  priv_len   = %u", (unsigned)cmd.priv_len);
+    LOG_INFO("  vendor_len = %u", (unsigned)cmd.vendor_len);
 
     if (ioctl(ctx->fd, OBMM_CMD_EXPORT_PID, &cmd) < 0) {
+        int saved_errno = errno;
         LOG_ERR("OBMM_CMD_EXPORT_PID failed: %s (errno=%d)",
-                strerror(errno), errno);
+                strerror(saved_errno), saved_errno);
+        /* Common EINVAL hypotheses and how to test them next:
+         *   - pages not prefaulted -> caller must write every page
+         *   - pxm_numa out of range -> try 0 (already doing this)
+         *   - MAP_ANONYMOUS not supported -> try hugetlbfs/memfd
+         *   - seid/deid must be non-zero -> borrow from URMA
+         * Full struct dumped above to aid diagnosis. */
+        errno = saved_errno;
         return OBMM_RW_ERR_IOCTL;
     }
 
