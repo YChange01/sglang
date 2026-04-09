@@ -76,22 +76,57 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t nid = 0;
-    if (ubmem_rw_local_nid(urw, &nid) == 0) {
-        printf("  local supernode nid = %u\n", nid);
+    /* 2. Query cluster for REAL hostnames — never hardcode "node1" etc.
+     *    The SDK stores the string from its discovery layer and expects
+     *    the same string back at create_region() time. If the names
+     *    don't match, create_region appears to succeed but the region
+     *    has zero valid hosts, and every shmem_allocate fails with
+     *    daemon error 800 (UBSM_ERR_UBSE). This is how we got bit on
+     *    the first run. */
+    ubmem_rw_cluster_t cluster;
+    if (ubmem_rw_query_cluster(urw, &cluster) != UBMEM_RW_OK) {
+        goto fail;
     }
-
-    /* 2. Ensure region exists spanning both nodes.
-     *    The server has local affinity; client will not. */
-    ubmem_rw_host_t hosts[2] = {
-        { .hostname = "node1", .affinity = true  },
-        { .hostname = "node2", .affinity = false },
-    };
-    if (ubmem_rw_ensure_region(urw, region_name, hosts, 2) != UBMEM_RW_OK) {
+    printf("  cluster host_num = %d, local_nid = %u, local_host_idx = %d\n",
+           cluster.n_hosts, cluster.local_nid, cluster.local_host_idx);
+    for (int h = 0; h < cluster.n_hosts; h++) {
+        printf("    host[%d] = \"%s\"%s\n",
+               h, cluster.hostnames[h],
+               (h == cluster.local_host_idx) ? "  (local)" : "");
+    }
+    if (cluster.n_hosts < 2) {
+        fprintf(stderr, "  [FAIL] cluster has < 2 hosts; scheme6 needs cross-node\n");
         goto fail;
     }
 
-    /* 3. Clean up any stale object from a previous run, then allocate.
+    ubmem_rw_host_t hosts[UBMEM_RW_MAX_HOSTS];
+    for (int h = 0; h < cluster.n_hosts; h++) {
+        hosts[h].hostname = cluster.hostnames[h];
+        /* Server is the data owner — give affinity to the local host so
+         * backing memory is placed on this node. Remote node(s) act as
+         * readers. */
+        hosts[h].affinity = (h == cluster.local_host_idx);
+    }
+
+    /* 3. Destroy any stale "engram_pool" region from a previous run
+     *    that may have been created with wrong hostnames. This is a
+     *    bench tool, not a production service — flushing per-run is
+     *    the right behavior. Wrapper treats NOT_FOUND as success, and
+     *    IN_USING is logged but non-fatal so we still try to proceed. */
+    printf("  destroying stale region \"%s\" (idempotent) ...\n", region_name);
+    int drc = ubmem_rw_destroy_region(urw, region_name);
+    if (drc != UBMEM_RW_OK) {
+        fprintf(stderr,
+                "  (region destroy returned rc=%d — continuing, may be in use)\n",
+                drc);
+    }
+
+    /* 4. Create it fresh with the REAL cluster hostnames. */
+    if (ubmem_rw_ensure_region(urw, region_name, hosts, cluster.n_hosts) != UBMEM_RW_OK) {
+        goto fail;
+    }
+
+    /* 5. Clean up any stale object from a previous run, then allocate.
      *    Ignore NOT_FOUND on the deallocate path. */
     (void)ubmem_rw_deallocate(urw, object_name);
 
@@ -108,7 +143,7 @@ int main(int argc, char *argv[])
         goto fail;
     }
 
-    /* 4. Map locally for writing. Use MAP_SHARED so the object is visible
+    /* 6. Map locally for writing. Use MAP_SHARED so the object is visible
      *    cluster-wide. Map the full aligned size — must match allocate(). */
     void *ptr = NULL;
     if (ubmem_rw_map(urw, object_name, alloc_size,
@@ -116,7 +151,7 @@ int main(int argc, char *argv[])
         goto fail_dealloc;
     }
 
-    /* 5. Fill with the Engram verification pattern — same as scheme5,
+    /* 7. Fill with the Engram verification pattern — same as scheme5,
      *    so a reader using row r expects data[r*dim + k] == (r*dim+k)*0.001f. */
     printf("\nfilling %.2f MB with pattern data[i] = i * 0.001f ...\n",
            total_size / (1024.0 * 1024.0));
@@ -153,7 +188,7 @@ int main(int argc, char *argv[])
         sleep(1);
     }
 
-    /* 6. Tear down in reverse order of creation. unmap must use the same
+    /* 8. Tear down in reverse order of creation. unmap must use the same
      *    length that was passed to map(). */
     printf("\nstopping, tearing down ...\n");
     (void)ubmem_rw_unmap(urw, ptr, alloc_size);

@@ -242,18 +242,36 @@ int main(int argc, char *argv[])
         return 1;
     }
 
-    uint32_t nid = 0;
-    if (ubmem_rw_local_nid(urw, &nid) == 0) {
-        printf("  local supernode nid = %u\n", nid);
+    /* Query real cluster hostnames (same reason as in server.c — never
+     * hardcode). We don't destroy the region here; the server owns it. */
+    ubmem_rw_cluster_t cluster;
+    if (ubmem_rw_query_cluster(urw, &cluster) != UBMEM_RW_OK) {
+        goto fail;
+    }
+    printf("  cluster host_num = %d, local_nid = %u, local_host_idx = %d\n",
+           cluster.n_hosts, cluster.local_nid, cluster.local_host_idx);
+    for (int h = 0; h < cluster.n_hosts; h++) {
+        printf("    host[%d] = \"%s\"%s\n",
+               h, cluster.hostnames[h],
+               (h == cluster.local_host_idx) ? "  (local)" : "");
+    }
+    if (cluster.n_hosts < 2) {
+        fprintf(stderr, "  [FAIL] cluster has < 2 hosts; scheme6 needs cross-node\n");
+        goto fail;
     }
 
-    /* Ensure same region topology. Client treats the remote host
-     * as having affinity (the data actually lives there). */
-    ubmem_rw_host_t hosts[2] = {
-        { .hostname = "node1", .affinity = true  },
-        { .hostname = "node2", .affinity = false },
-    };
-    if (ubmem_rw_ensure_region(urw, region_name, hosts, 2) != UBMEM_RW_OK) {
+    /* Build the same host list the server used. Affinity doesn't matter
+     * on the ALREADY_EXIST path (the region is already defined), but
+     * we keep it consistent so the create call is meaningful if the
+     * client ever happens to race ahead of the server. The data actually
+     * lives on the "remote" host from the client's perspective — i.e.
+     * the non-local entry should have affinity. */
+    ubmem_rw_host_t hosts[UBMEM_RW_MAX_HOSTS];
+    for (int h = 0; h < cluster.n_hosts; h++) {
+        hosts[h].hostname = cluster.hostnames[h];
+        hosts[h].affinity = (h != cluster.local_host_idx);
+    }
+    if (ubmem_rw_ensure_region(urw, region_name, hosts, cluster.n_hosts) != UBMEM_RW_OK) {
         goto fail;
     }
 

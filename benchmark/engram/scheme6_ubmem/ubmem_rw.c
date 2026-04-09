@@ -12,6 +12,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>        /* gethostname */
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -117,6 +118,75 @@ int ubmem_rw_local_nid(ubmem_rw_ctx_t *ctx, uint32_t *out_nid)
     if (!ctx || !out_nid) return UBMEM_RW_ERR_PARAM;
     int rc = ubsmem_local_nid_query(out_nid);
     return (rc == 0) ? UBMEM_RW_OK : rc;
+}
+
+int ubmem_rw_query_cluster(ubmem_rw_ctx_t *ctx, ubmem_rw_cluster_t *out)
+{
+    if (!ctx || !out) return UBMEM_RW_ERR_PARAM;
+    memset(out, 0, sizeof(*out));
+    out->local_host_idx = -1;
+
+    /* (1) local nid for printing / local-host-idx cross-check */
+    int rc = ubsmem_local_nid_query(&out->local_nid);
+    if (rc != 0) {
+        LOG_ERR("ubsmem_local_nid_query failed: rc=%d (%s)",
+                rc, ubmem_rw_strerror(rc));
+        return rc;
+    }
+
+    /* (2) enumerate hosts as the SDK knows them */
+    ubsmem_cluster_info_t ci;
+    memset(&ci, 0, sizeof(ci));
+    rc = ubsmem_lookup_cluster_statistic(&ci);
+    if (rc != 0) {
+        LOG_ERR("ubsmem_lookup_cluster_statistic failed: rc=%d (%s)",
+                rc, ubmem_rw_strerror(rc));
+        return rc;
+    }
+    if (ci.host_num <= 0) {
+        LOG_ERR("cluster has 0 hosts — ubsmd discovery not ready");
+        return UBMEM_RW_ERR;
+    }
+
+    int nh = ci.host_num;
+    if (nh > UBMEM_RW_MAX_HOSTS) nh = UBMEM_RW_MAX_HOSTS;
+    out->n_hosts = nh;
+    for (int h = 0; h < nh; h++) {
+        /* ubsmem_host_info_t.host_name is a fixed-size char[] in the SDK.
+         * Copy defensively with a NUL terminator. */
+        strncpy(out->hostnames[h], ci.host[h].host_name,
+                UBMEM_RW_MAX_HOSTNAME - 1);
+        out->hostnames[h][UBMEM_RW_MAX_HOSTNAME - 1] = '\0';
+    }
+
+    /* (3) try to find which entry corresponds to the local node.
+     * The SDK doesn't expose a direct "which host am I" call, so we
+     * fall back to comparing gethostname() against the reported names. */
+    char myhost[UBMEM_RW_MAX_HOSTNAME] = {0};
+    if (gethostname(myhost, sizeof(myhost) - 1) == 0) {
+        /* Some clusters report FQDN; truncate at the first dot for a
+         * lenient match ("node1" == "node1.cluster.local"). */
+        for (int h = 0; h < nh; h++) {
+            if (strcmp(out->hostnames[h], myhost) == 0) {
+                out->local_host_idx = h;
+                break;
+            }
+        }
+        if (out->local_host_idx < 0) {
+            const char *dot = strchr(myhost, '.');
+            size_t plain_len = dot ? (size_t)(dot - myhost) : strlen(myhost);
+            for (int h = 0; h < nh; h++) {
+                if (strncmp(out->hostnames[h], myhost, plain_len) == 0 &&
+                    (out->hostnames[h][plain_len] == '\0' ||
+                     out->hostnames[h][plain_len] == '.')) {
+                    out->local_host_idx = h;
+                    break;
+                }
+            }
+        }
+    }
+
+    return UBMEM_RW_OK;
 }
 
 /* ================================================================== */

@@ -67,9 +67,35 @@ typedef struct ubmem_rw_ctx ubmem_rw_ctx_t;
 
 /* Describes one host that participates in a region. */
 typedef struct {
-    const char *hostname;   /* e.g. "node1" — must match what ubsmd reports */
+    const char *hostname;   /* must match what ubsmd's lookup_cluster_statistic reports */
     bool        affinity;   /* true if backing memory should prefer this host */
 } ubmem_rw_host_t;
+
+/* Snapshot of the cluster returned by ubmem_rw_query_cluster().
+ *
+ * Hostnames are OWNED by this struct (caller-provided storage) — copied
+ * from ubsmem_cluster_info_t at query time. Use these strings directly
+ * when building a ubmem_rw_host_t[] for ensure_region().
+ *
+ * CRITICAL: the hostnames returned here are what the SDK expects —
+ * passing hardcoded "node1"/"node2" that don't match cluster reality
+ * results in a region with zero valid hosts, and every subsequent
+ * shmem_allocate fails with daemon error 800 / UBSM_ERR_UBSE. */
+#define UBMEM_RW_MAX_HOSTS    8
+#define UBMEM_RW_MAX_HOSTNAME 256
+
+typedef struct {
+    int       n_hosts;                                     /* how many host[] slots are valid */
+    uint32_t  local_nid;                                   /* from ubsmem_local_nid_query */
+    int       local_host_idx;                              /* which host[] matches this node, or -1 */
+    char      hostnames[UBMEM_RW_MAX_HOSTS][UBMEM_RW_MAX_HOSTNAME];
+} ubmem_rw_cluster_t;
+
+/* Query the cluster: populate hostnames from ubsmd, identify the local
+ * node (via gethostname comparison). Must be called after ubmem_rw_init.
+ *
+ * Returns UBMEM_RW_OK on success, negative or SDK error code on failure. */
+int ubmem_rw_query_cluster(ubmem_rw_ctx_t *ctx, ubmem_rw_cluster_t *out);
 
 /* ================================================================== */
 /*  Init / shutdown                                                    */
