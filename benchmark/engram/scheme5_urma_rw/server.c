@@ -7,7 +7,9 @@
  *            ~10000 rows x 12 tables)
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "urma_rw.h"
 #include <stdio.h>
 #include <stdlib.h>

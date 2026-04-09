@@ -2,7 +2,9 @@
  * URMA RW implementation — based on openEuler umdk urma_sample.c pattern.
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "urma_rw.h"
 
 #include <stdio.h>

@@ -8,7 +8,9 @@
  *   ./client 192.168.84.245 13857 10000 341
  */
 
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 #include "urma_rw.h"
 #include <stdio.h>
 #include <stdlib.h>
