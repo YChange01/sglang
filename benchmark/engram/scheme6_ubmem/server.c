@@ -55,12 +55,18 @@ int main(int argc, char *argv[])
 
     size_t row_bytes  = (size_t)dim * sizeof(float);
     size_t total_size = (size_t)num_rows * row_bytes;
+    /* ubs_mem requires allocations to be a multiple of 4 MB. Round the
+     * logical table size up; we only touch the first `total_size` bytes
+     * during fill, the tail is unused padding. */
+    size_t alloc_size = UBMEM_RW_ALIGN_UP(total_size);
 
     printf("=== scheme6 ubs_mem server ===\n");
     printf("  region = \"%s\"\n", region_name);
     printf("  object = \"%s\"\n", object_name);
-    printf("  table  = %ld rows x %ld dim = %.2f MB\n",
+    printf("  table  = %ld rows x %ld dim = %.2f MB (logical)\n",
            num_rows, dim, total_size / (1024.0 * 1024.0));
+    printf("  alloc  = %.2f MB (4MB-aligned for ubs_mem)\n",
+           alloc_size / (1024.0 * 1024.0));
     printf("\n");
 
     /* 1. SDK init */
@@ -91,22 +97,21 @@ int main(int argc, char *argv[])
 
     /* For the initial smoke test, use the default 4KB page path
      * (UBMEM_RW_FLAG_CACHE = 0). Hugepage (UBMEM_RW_FLAG_HUGEPAGE,
-     * 2MB PMD granularity) is better for large (200GB) tables, but
-     * requires 2MB-aligned sizes. Re-enable it once the baseline
-     * works end-to-end:
+     * 2MB PMD granularity) is better for large (200GB) tables; both
+     * 4KB and 2MB paths still require the 4MB-aligned alloc_size.
+     * Re-enable hugepages once the baseline works:
      *     alloc_flags |= UBMEM_RW_FLAG_HUGEPAGE;
-     *     total_size = (total_size + (2<<20) - 1) & ~(size_t)((2<<20) - 1);
      */
     uint64_t alloc_flags = UBMEM_RW_FLAG_CACHE;
     if (ubmem_rw_allocate(urw, region_name, object_name,
-                          total_size, 0644, alloc_flags) != UBMEM_RW_OK) {
+                          alloc_size, 0644, alloc_flags) != UBMEM_RW_OK) {
         goto fail;
     }
 
     /* 4. Map locally for writing. Use MAP_SHARED so the object is visible
-     *    cluster-wide. Hugepage flag is already set at allocate time. */
+     *    cluster-wide. Map the full aligned size — must match allocate(). */
     void *ptr = NULL;
-    if (ubmem_rw_map(urw, object_name, total_size,
+    if (ubmem_rw_map(urw, object_name, alloc_size,
                      PROT_READ | PROT_WRITE, MAP_SHARED, 0, &ptr) != UBMEM_RW_OK) {
         goto fail_dealloc;
     }
@@ -148,9 +153,10 @@ int main(int argc, char *argv[])
         sleep(1);
     }
 
-    /* 6. Tear down in reverse order of creation. */
+    /* 6. Tear down in reverse order of creation. unmap must use the same
+     *    length that was passed to map(). */
     printf("\nstopping, tearing down ...\n");
-    (void)ubmem_rw_unmap(urw, ptr, total_size);
+    (void)ubmem_rw_unmap(urw, ptr, alloc_size);
     (void)ubmem_rw_deallocate(urw, object_name);
     /* Leave the region intact — other users might share it. Uncomment if
      * you want to destroy the region on exit:

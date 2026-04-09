@@ -224,12 +224,16 @@ int main(int argc, char *argv[])
 
     size_t row_bytes  = (size_t)dim * sizeof(float);
     size_t total_size = (size_t)num_rows * row_bytes;
+    /* Must match the server's aligned allocation — ubs_mem 4 MB min. */
+    size_t alloc_size = UBMEM_RW_ALIGN_UP(total_size);
 
     printf("=== scheme6 ubs_mem client ===\n");
     printf("  region = \"%s\"\n", region_name);
     printf("  object = \"%s\"\n", object_name);
-    printf("  table  = %ld rows x %ld dim = %.2f MB\n",
+    printf("  table  = %ld rows x %ld dim = %.2f MB (logical)\n",
            num_rows, dim, total_size / (1024.0 * 1024.0));
+    printf("  alloc  = %.2f MB (4MB-aligned for ubs_mem)\n",
+           alloc_size / (1024.0 * 1024.0));
     printf("  iters  = %d\n", num_iters);
 
     ubmem_rw_ctx_t *urw = ubmem_rw_init();
@@ -254,9 +258,11 @@ int main(int argc, char *argv[])
     }
 
     /* Map the shmem object read-only. The backing memory lives on the
-     * server; this call returns a local VA routed by UBMMU to UB fabric. */
+     * server; this call returns a local VA routed by UBMMU to UB fabric.
+     * Map length must match the server's allocate() — the 4MB-aligned
+     * alloc_size, not the logical total_size. */
     void *ptr = NULL;
-    if (ubmem_rw_map(urw, object_name, total_size,
+    if (ubmem_rw_map(urw, object_name, alloc_size,
                      PROT_READ, MAP_SHARED, 0, &ptr) != UBMEM_RW_OK) {
         fprintf(stderr, "map failed — is the server running and object allocated?\n");
         goto fail;
@@ -267,7 +273,7 @@ int main(int argc, char *argv[])
     /* Verify the pattern first. If this fails, bench numbers are meaningless. */
     if (verify_row(ptr, dim, 42) != 0) {
         fprintf(stderr, "verification FAILED — bailing out before benches\n");
-        (void)ubmem_rw_unmap(urw, ptr, total_size);
+        (void)ubmem_rw_unmap(urw, ptr, alloc_size);
         goto fail;
     }
 
@@ -275,7 +281,7 @@ int main(int argc, char *argv[])
     bench_batch (ptr, num_rows, dim, num_iters);
     bench_engram_prefetch(ptr, num_rows, dim, num_iters);
 
-    (void)ubmem_rw_unmap(urw, ptr, total_size);
+    (void)ubmem_rw_unmap(urw, ptr, alloc_size);
     ubmem_rw_destroy(urw);
     printf("\nDone.\n");
     return 0;

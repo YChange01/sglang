@@ -46,6 +46,22 @@ extern "C" {
 #define UBMEM_RW_ERR_PARAM   -2
 #define UBMEM_RW_ERR_NOTFOUND -3
 
+/* Allocation alignment required by the ubs_mem SDK.
+ *
+ * Empirical finding: ubsmem_shmem_allocate() rejects any size that is
+ * not a multiple of 4 MB with UBSM_ERR_PARAM_INVALID and an internal
+ * log line like:
+ *     "The size N does not align with 4194304"
+ *
+ * This is enforced regardless of the HUGEPAGE flag — it appears to be
+ * the minimum granularity the OBMM kernel driver works in. Both
+ * allocation and mapping must use the same aligned size. Callers
+ * should always pass a size that is UBMEM_RW_ALIGN_UP'd.
+ */
+#define UBMEM_RW_ALIGN_BYTES  (4UL * 1024UL * 1024UL)
+#define UBMEM_RW_ALIGN_UP(x)  \
+    (((size_t)(x) + UBMEM_RW_ALIGN_BYTES - 1UL) & ~(UBMEM_RW_ALIGN_BYTES - 1UL))
+
 /* Opaque context */
 typedef struct ubmem_rw_ctx ubmem_rw_ctx_t;
 
