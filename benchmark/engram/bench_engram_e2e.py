@@ -4,38 +4,27 @@
 Simulates the full Engram inference pipeline with realistic parameters
 from arXiv:2603.10087, without requiring a trained Engram model.
 
-Flow:
-  1. Generate random Engram embedding tables (matching real model size)
-  2. Load tables into yuanrong-datasystem pool (via KVClient / URMA)
-  3. Simulate inference loop:
-     - Generate random N-gram hash indices (as a real model would)
-     - Prefetch embeddings from pool asynchronously
-     - Simulate Transformer compute (GPU sleep or real model)
-     - Gather prefetched results
-     - Measure: prefetch latency, overlap ratio, throughput impact
-  4. Report results comparable to the paper's Table 1 & Figure 5
+Two read modes:
+  --mode kv     : Per-key KVClient.get() (baseline, high RPC overhead)
+  --mode shm    : ObjectClient shared memory mmap (like CXL paper's approach)
+
+The shared memory mode stores each table as one contiguous buffer and reads
+rows by byte offset — zero per-key RPC, matching CXL's mmap semantics.
 
 Usage:
-  # Mock mode (no Worker needed, tests logic + CPU overhead):
-  python bench_engram_e2e.py --mock
+  # Shared memory mode (recommended, matches paper)
+  python bench_engram_e2e.py --mode shm --hosts 10.0.0.1 --ports 18483
 
-  # With real Worker:
-  python bench_engram_e2e.py --hosts 10.0.0.1 --ports 18482
+  # KV mode (baseline comparison)
+  python bench_engram_e2e.py --mode kv --hosts 10.0.0.1 --ports 18483
 
-  # With real Worker + real model (measures actual throughput impact):
-  python bench_engram_e2e.py --hosts 10.0.0.1 --ports 18482 \
-      --with-model --model-path Qwen/Qwen2.5-7B
+  # Mock mode (no Worker)
+  python bench_engram_e2e.py --mode mock
 
-Paper reference parameters (DeepSeek-like Engram, 100B params ≈ 200GB bf16):
-  - 12 sub-tables (over_embedding_k=3, over_embedding_n=5 → 3*(5-1)=12)
-  - ~5 KB per token per Engram layer
-  - oe_hidden_dim = model_dim / n_grams (e.g. 4096/12 ≈ 341)
-  - table rows: M + 2*i + 1, where M ≈ 24,400,000 (for 100B total params)
-  - Total: 12 tables × 24.4M rows × 341 dim × 2B(bf16) ≈ 200 GB
+Paper reference: 200GB Engram (100B bf16 params), 12 sub-tables, ~8KB/token
 """
 
 import argparse
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -44,30 +33,22 @@ from typing import List, Optional
 import numpy as np
 
 # ---------------------------------------------------------------------------
-#  Engram model parameters (matching paper / DeepSeek-like config)
+#  Engram model parameters
 # ---------------------------------------------------------------------------
 
 @dataclass
 class EngramModelSpec:
     """Simulated Engram model specification.
-
-    Default: 100B params ≈ 200GB (bf16), matching paper's DeepSeek Engram.
-    Use --total-size-gb to scale up/down for your hardware.
+    Default: 100B params ~ 200GB (bf16), matching paper.
     """
-    model_dim: int = 4096           # hidden_size
-    num_tables: int = 12            # n_grams = k * (n-1)
-    over_embedding_m: int = 0       # base modulus (0 = auto from total_size_gb)
-    over_embedding_k: int = 3       # hash functions per order
-    over_embedding_n: int = 5       # max N-gram order
-    vocab_size: int = 131072        # token vocabulary
+    model_dim: int = 4096
+    num_tables: int = 12
+    over_embedding_m: int = 0       # 0 = auto from total_size_gb
     dtype_bytes: int = 2            # 2=bf16, 4=float32
-    total_size_gb: float = 200.0    # target total size in GB
+    total_size_gb: float = 200.0
 
     def __post_init__(self):
         if self.over_embedding_m == 0:
-            # Auto-compute M from total_size_gb
-            # total_bytes = num_tables * M * oe_hidden_dim * dtype_bytes
-            # M = total_bytes / (num_tables * oe_hidden_dim * dtype_bytes)
             total_bytes = self.total_size_gb * (1024 ** 3)
             dim = self.model_dim // self.num_tables
             self.over_embedding_m = int(
@@ -79,364 +60,312 @@ class EngramModelSpec:
         return self.model_dim // self.num_tables
 
     @property
-    def bytes_per_token_per_table(self) -> int:
-        return self.oe_hidden_dim * self.dtype_bytes
+    def bytes_per_row(self) -> int:
+        return self.oe_hidden_dim * 4  # always stored as float32
 
     @property
     def bytes_per_token_total(self) -> int:
-        return self.bytes_per_token_per_table * self.num_tables
+        return self.bytes_per_row * self.num_tables
 
     def table_rows(self, table_idx: int) -> int:
-        """Number of rows in sub-table i."""
         return self.over_embedding_m + 2 * table_idx + 1
 
-    def total_params(self) -> int:
-        """Total embedding parameters across all sub-tables."""
-        return sum(
-            self.table_rows(i) * self.oe_hidden_dim
+    def total_gb(self) -> float:
+        total = sum(
+            self.table_rows(i) * self.oe_hidden_dim * self.dtype_bytes
             for i in range(self.num_tables)
         )
-
-    def total_bytes(self) -> int:
-        return self.total_params() * self.dtype_bytes
-
-    def total_gb(self) -> float:
-        return self.total_bytes() / (1024 ** 3)
+        return total / (1024 ** 3)
 
     def summary(self) -> str:
         per_tok_kb = self.bytes_per_token_total / 1024
-        dtype_name = "bf16" if self.dtype_bytes == 2 else "fp32"
         return (
-            f"Engram spec: {self.num_tables} tables, "
-            f"dim={self.oe_hidden_dim}, M={self.over_embedding_m:,}, "
-            f"dtype={dtype_name}\n"
-            f"  Total: {self.total_gb():.1f} GB "
-            f"({self.total_params()/1e9:.1f}B params), "
+            f"Engram: {self.num_tables} tables, dim={self.oe_hidden_dim}, "
+            f"M={self.over_embedding_m:,}\n"
+            f"  Full size: {self.total_gb():.1f} GB, "
             f"per_token={per_tok_kb:.1f} KB"
         )
 
 
 # ---------------------------------------------------------------------------
-#  Mock KVClient (for testing without Worker)
+#  Shared Memory Table Manager (ObjectClient-based, like CXL mmap)
 # ---------------------------------------------------------------------------
 
-class MockKVClient:
-    def __init__(self, **kw):
-        self._store = {}
-        self._read_count = 0
+class ShmTableManager:
+    """Stores each Engram table as one contiguous shared memory buffer.
 
-    def init(self):
-        pass
-
-    def mset(self, keys, vals, **kw):
-        for k, v in zip(keys, vals):
-            self._store[k] = v
-        return []
-
-    def get(self, keys, **kw):
-        self._read_count += len(keys)
-        return [self._store.get(k) for k in keys]
-
-
-# ---------------------------------------------------------------------------
-#  Table generation & loading
-# ---------------------------------------------------------------------------
-
-def create_kv_client(host, port, use_mock=False, use_ipc=False):
-    if use_mock:
-        return MockKVClient()
-    from yr.datasystem import KVClient
-    client = KVClient(
-        host=host, port=port, timeout_ms=60000, req_timeout_ms=10000,
-        enable_exclusive_connection=use_ipc,
-    )
-    client.init()
-    return client
-
-
-def generate_and_load_tables(
-    client, spec: EngramModelSpec, key_prefix="engram",
-    max_rows_per_table: int = 0,
-) -> dict:
-    """Generate random embedding tables and load into KVClient.
-
-    Uses the same chunk-addressed key format as EngramPool
-    (``{prefix}:t{table_id}:c{chunk_id}``) so that both the benchmark's
-    direct reads and EngramPool.batch_lookup() can access the same data.
-
-    Args:
-        max_rows_per_table: If > 0, cap each table at this many rows.
-
-    Returns metadata dict with timing info.
+    Read = byte offset into memoryview. Zero RPC per row.
+    This matches CXL paper's mmap approach.
     """
-    total_bytes = 0
-    t0 = time.perf_counter()
-    chunk_size = 1  # one row per key, matching EngramPool default
 
-    for t in range(spec.num_tables):
-        full_rows = spec.table_rows(t)
-        nrows = min(full_rows, max_rows_per_table) if max_rows_per_table > 0 else full_rows
-        dim = spec.oe_hidden_dim
-        # Always store as float32 (matching EngramPool.load_table)
+    def __init__(self, host, port, use_mock=False):
+        self.host = host
+        self.port = port
+        self.use_mock = use_mock
+        self._client = None
+        self._buffers = {}   # table_id -> memoryview
+        self._table_meta = {}  # table_id -> {nrows, dim, row_bytes}
+
+    def initialize(self):
+        if self.use_mock:
+            return
+        from yr.datasystem import ObjectClient
+        self._client = ObjectClient(
+            host=self.host, port=self.port, timeout_ms=60000,
+        )
+        self._client.init()
+
+    def load_table(self, table_id: int, nrows: int, dim: int):
+        """Generate random data and store as one contiguous buffer."""
+        row_bytes = dim * 4  # float32
+        total_bytes = nrows * row_bytes
+        data = np.random.randn(nrows, dim).astype(np.float32).tobytes()
+
+        key = f"engram_shm:t{table_id}"
+        self._table_meta[table_id] = {
+            "nrows": nrows, "dim": dim, "row_bytes": row_bytes
+        }
+
+        if self.use_mock:
+            self._buffers[table_id] = memoryview(bytearray(data))
+            return
+
+        # Write to ObjectClient
+        self._client.g_increase_ref([key])
+        self._client.put(key, data)
+
+    def open_table(self, table_id: int):
+        """Get read-only memoryview to the table buffer."""
+        if self.use_mock:
+            return  # already in _buffers
+
+        key = f"engram_shm:t{table_id}"
+        buffers = self._client.get([key], timeout_ms=10000)
+        buf = buffers[0]
+        self._buffers[table_id] = buf.immutable_data()
+
+    def read_rows(self, table_id: int, row_ids: np.ndarray) -> np.ndarray:
+        """Read specific rows by byte offset. Zero RPC."""
+        meta = self._table_meta[table_id]
+        dim = meta["dim"]
+        row_bytes = meta["row_bytes"]
+        mv = self._buffers[table_id]
+
+        result = np.empty((len(row_ids), dim), dtype=np.float32)
+        for i, rid in enumerate(row_ids):
+            start = int(rid) * row_bytes
+            end = start + row_bytes
+            result[i] = np.frombuffer(mv[start:end], dtype=np.float32)
+        return result
+
+    def read_rows_fast(self, table_id: int, row_ids: np.ndarray) -> np.ndarray:
+        """Vectorized read using numpy fancy indexing on the raw buffer."""
+        meta = self._table_meta[table_id]
+        dim = meta["dim"]
+        mv = self._buffers[table_id]
+
+        # Interpret entire buffer as float32 2D array
+        flat = np.frombuffer(mv, dtype=np.float32).reshape(-1, dim)
+        return flat[row_ids]
+
+    def shutdown(self):
+        self._buffers.clear()
+
+
+# ---------------------------------------------------------------------------
+#  KV-based reader (baseline, for comparison)
+# ---------------------------------------------------------------------------
+
+class KVTableManager:
+    """Per-key KVClient reads. High RPC overhead baseline."""
+
+    def __init__(self, host, port, use_ipc=False):
+        self.host = host
+        self.port = port
+        self.use_ipc = use_ipc
+        self._client = None
+        self._table_meta = {}
+
+    def initialize(self):
+        from yr.datasystem import KVClient
+        self._client = KVClient(
+            host=self.host, port=self.port, timeout_ms=60000,
+            req_timeout_ms=10000, enable_exclusive_connection=self.use_ipc,
+        )
+        self._client.init()
+
+    def load_table(self, table_id: int, nrows: int, dim: int):
         row_bytes = dim * 4
-
-        # Generate and write in batches of 2000 (KVClient limit)
+        self._table_meta[table_id] = {"nrows": nrows, "dim": dim, "row_bytes": row_bytes}
         batch_size = 2000
         for start in range(0, nrows, batch_size):
             end = min(start + batch_size, nrows)
             chunk = np.random.randn(end - start, dim).astype(np.float32)
-            # Use chunk-addressed keys: c{chunk_id} where chunk_id == row_id
-            # when chunk_size == 1
-            keys = [f"{key_prefix}:t{t}:c{r}" for r in range(start, end)]
+            keys = [f"engram:t{table_id}:c{r}" for r in range(start, end)]
             vals = [chunk[r - start].tobytes() for r in range(start, end)]
-            failed = client.mset(keys, vals)
-            if failed:
-                print(f"  WARNING: {len(failed)} keys failed on table {t}")
+            self._client.mset(keys, vals)
 
-        table_mb = nrows * row_bytes / 1e6
-        total_bytes += nrows * row_bytes
-        elapsed = time.perf_counter() - t0
-        full_mb = full_rows * row_bytes / 1e6
-        suffix = f" (capped from {full_rows:,} = {full_mb:.0f}MB)" if nrows < full_rows else ""
-        print(
-            f"  Table {t:2d}: {nrows:,} rows x {dim}d = {table_mb:6.1f} MB{suffix} "
-            f"[{elapsed:.1f}s elapsed]",
-            flush=True,
-        )
+    def open_table(self, table_id: int):
+        pass  # nothing to open for KV mode
 
-    total_sec = time.perf_counter() - t0
-    total_mb = total_bytes / 1e6
-    full_total_gb = spec.total_gb()
-    print(
-        f"  Loaded: {total_mb:.0f} MB in {total_sec:.1f}s "
-        f"({total_mb/total_sec:.0f} MB/s)",
-        flush=True,
-    )
-    print(
-        f"  Full Engram size (if uncapped): {full_total_gb:.1f} GB",
-        flush=True,
-    )
-    return {"total_bytes": total_bytes, "load_time_s": total_sec}
+    def read_rows(self, table_id: int, row_ids: np.ndarray) -> np.ndarray:
+        meta = self._table_meta[table_id]
+        dim = meta["dim"]
+        keys = [f"engram:t{table_id}:c{r}" for r in row_ids]
+        vals = self._client.get(keys)
+        result = np.empty((len(row_ids), dim), dtype=np.float32)
+        for i, v in enumerate(vals):
+            result[i] = np.frombuffer(v, dtype=np.float32)
+        return result
 
-
-# ---------------------------------------------------------------------------
-#  Simulate Engram inference
-# ---------------------------------------------------------------------------
-
-def simulate_ngram_indices(
-    batch_tokens: int, spec: EngramModelSpec, max_rows: int = 0
-) -> List[tuple]:
-    """Generate random hash indices simulating compute_n_gram_ids.
-
-    Returns list of (table_id, row_ids_array).
-    """
-    result = []
-    for t in range(spec.num_tables):
-        full_rows = spec.table_rows(t)
-        nrows = min(full_rows, max_rows) if max_rows > 0 else full_rows
-        row_ids = np.random.randint(0, nrows, size=batch_tokens)
-        result.append((t, row_ids))
-    return result
-
-
-def prefetch_from_pool(
-    client, table_indices: List[tuple], spec: EngramModelSpec,
-    key_prefix="engram", executor=None
-) -> tuple:
-    """Fetch embeddings from pool. Returns (data_bytes, elapsed_sec)."""
-    dim = spec.oe_hidden_dim
-    row_bytes = dim * 4  # stored as float32
-
-    t0 = time.perf_counter()
-    total_bytes = 0
-
-    def fetch_table(t, row_ids):
-        # Use chunk-addressed keys matching EngramPool and generate_and_load_tables
-        keys = [f"{key_prefix}:t{t}:c{r}" for r in row_ids]
-        # Batch into 10000 chunks (API limit)
-        results = []
-        for i in range(0, len(keys), 10000):
-            results.extend(client.get(keys[i:i+10000]))
-        return len(results) * row_bytes
-
-    if executor:
-        futures = []
-        for t, row_ids in table_indices:
-            futures.append(executor.submit(fetch_table, t, row_ids))
-        for f in futures:
-            total_bytes += f.result()
-    else:
-        for t, row_ids in table_indices:
-            total_bytes += fetch_table(t, row_ids)
-
-    elapsed = time.perf_counter() - t0
-    return total_bytes, elapsed
-
-
-def simulate_transformer_compute(duration_ms: float):
-    """Simulate GPU compute time."""
-    time.sleep(duration_ms / 1000.0)
+    def shutdown(self):
+        pass
 
 
 # ---------------------------------------------------------------------------
 #  Benchmarks
 # ---------------------------------------------------------------------------
 
-def bench_prefetch_latency(
-    client, spec: EngramModelSpec, batch_sizes=(32, 64, 128, 256),
-    num_iters=10, executor=None, max_rows=0
-):
-    """Measure prefetch latency for various batch sizes."""
-    print("\n[Bench 1] Prefetch Latency vs Batch Size")
-    print(f"  {'Batch':>8} {'Tokens':>8} {'Data/iter':>10} {'Avg ms':>10} {'Throughput':>12}")
-    print("  " + "-" * 55)
+def bench_single_read_latency(mgr, spec, max_rows, num_iters=200):
+    """Measure latency for reading a single row."""
+    print("\n[Bench 1] Single Row Read Latency")
+
+    table_id = 0
+    latencies = []
+    for _ in range(num_iters):
+        rid = np.random.randint(0, max_rows, size=1)
+        t0 = time.perf_counter()
+        mgr.read_rows(table_id, rid)
+        latencies.append((time.perf_counter() - t0) * 1e6)
+
+    avg = np.mean(latencies)
+    p50 = np.percentile(latencies, 50)
+    p99 = np.percentile(latencies, 99)
+    print(f"  Avg: {avg:.1f} us, P50: {p50:.1f} us, P99: {p99:.1f} us")
+    return avg
+
+
+def bench_batch_read_latency(mgr, spec, max_rows, num_iters=50):
+    """Measure batch read for different sizes."""
+    print("\n[Bench 2] Batch Read Latency (single table)")
+    print(f"  {'Rows':>8} {'Data':>10} {'Avg ms':>10} {'Throughput':>12}")
+    print("  " + "-" * 45)
+
+    for nrows in [32, 128, 512, 2048]:
+        latencies = []
+        for _ in range(num_iters):
+            rids = np.random.randint(0, max_rows, size=nrows)
+            t0 = time.perf_counter()
+            mgr.read_rows(0, rids)
+            latencies.append((time.perf_counter() - t0) * 1000)
+
+        avg_ms = np.mean(latencies)
+        data_kb = nrows * spec.bytes_per_row / 1024
+        tp = (data_kb / 1024) / (avg_ms / 1000) if avg_ms > 0 else 0
+        print(f"  {nrows:>8} {data_kb:>8.1f}KB {avg_ms:>9.3f} {tp:>9.1f} MB/s")
+
+
+def bench_prefetch_latency(mgr, spec, batch_sizes, max_rows, num_iters=10):
+    """Full Engram prefetch: all tables × batch_size tokens."""
+    print("\n[Bench 3] Full Engram Prefetch (12 tables × N tokens)")
+    print(f"  {'Batch':>8} {'Data':>10} {'Avg ms':>10} {'Throughput':>12}")
+    print("  " + "-" * 45)
 
     for bs in batch_sizes:
         latencies = []
         for _ in range(num_iters):
-            indices = simulate_ngram_indices(bs, spec, max_rows)
-            data_bytes, elapsed = prefetch_from_pool(
-                client, indices, spec, executor=executor
-            )
-            latencies.append(elapsed * 1000)
+            t0 = time.perf_counter()
+            for t in range(spec.num_tables):
+                rids = np.random.randint(0, max_rows, size=bs)
+                mgr.read_rows(t, rids)
+            elapsed = (time.perf_counter() - t0) * 1000
+            latencies.append(elapsed)
 
         avg_ms = np.mean(latencies)
         data_kb = spec.bytes_per_token_total * bs / 1024
-        throughput = (data_kb / 1024) / (avg_ms / 1000) if avg_ms > 0 else 0
-        print(
-            f"  {bs:>8} {bs:>8} {data_kb:>8.1f}KB {avg_ms:>9.2f} {throughput:>9.1f} MB/s"
-        )
+        tp = (data_kb / 1024) / (avg_ms / 1000) if avg_ms > 0 else 0
+        print(f"  {bs:>8} {data_kb:>8.1f}KB {avg_ms:>9.2f} {tp:>9.1f} MB/s")
 
 
-def bench_overlap_efficiency(
-    client, spec: EngramModelSpec, batch_size=128,
-    compute_ms=5.0, num_iters=20, executor=None, max_rows=0
-):
-    """Measure how well prefetch overlaps with Transformer compute.
-
-    If prefetch takes P ms and compute takes C ms:
-    - Sequential: P + C ms
-    - Overlap: max(P, C) ms
-    - Efficiency = 1 - (total - C) / P  (1.0 = perfect overlap)
-    """
-    print(f"\n[Bench 2] Overlap Efficiency (batch={batch_size}, compute={compute_ms}ms)")
-
-    # First measure standalone prefetch time
-    prefetch_times = []
-    for _ in range(num_iters):
-        indices = simulate_ngram_indices(batch_size, spec, max_rows)
-        _, elapsed = prefetch_from_pool(client, indices, spec, executor=executor)
-        prefetch_times.append(elapsed * 1000)
-    avg_prefetch_ms = np.mean(prefetch_times)
-
-    # Then measure overlapped
-    overlap_times = []
-    thread_pool = ThreadPoolExecutor(max_workers=4)
-    for _ in range(num_iters):
-        indices = simulate_ngram_indices(batch_size, spec, max_rows)
-        t0 = time.perf_counter()
-        # Launch prefetch in background
-        fut = thread_pool.submit(
-            prefetch_from_pool, client, indices, spec, "engram", executor
-        )
-        # Simulate compute
-        simulate_transformer_compute(compute_ms)
-        # Wait for prefetch
-        fut.result()
-        total_ms = (time.perf_counter() - t0) * 1000
-        overlap_times.append(total_ms)
-    thread_pool.shutdown(wait=False)
-
-    avg_total_ms = np.mean(overlap_times)
-    sequential_ms = avg_prefetch_ms + compute_ms
-    overhead_ms = max(0, avg_total_ms - compute_ms)
-    efficiency = 1.0 - overhead_ms / avg_prefetch_ms if avg_prefetch_ms > 0 else 0
-
-    print(f"  Prefetch alone:    {avg_prefetch_ms:>8.2f} ms")
-    print(f"  Compute alone:     {compute_ms:>8.2f} ms")
-    print(f"  Sequential (P+C):  {sequential_ms:>8.2f} ms")
-    print(f"  Overlapped:        {avg_total_ms:>8.2f} ms")
-    print(f"  Overhead:          {overhead_ms:>8.2f} ms")
-    print(f"  Overlap efficiency:{efficiency:>8.1%}")
-    if efficiency > 0.8:
-        print("  => GOOD: prefetch mostly hidden behind compute")
-    elif efficiency > 0.5:
-        print("  => OK: partial overlap, consider increasing prefetch_ahead")
-    else:
-        print("  => POOR: prefetch dominates, need faster transport")
-
-
-def bench_scaling(
-    hosts, ports, spec: EngramModelSpec, batch_size=128,
-    num_iters=10, use_mock=False, max_rows=0, use_ipc=False
-):
-    """Measure throughput scaling with multiple Workers."""
-    print(f"\n[Bench 3] Multi-Worker Scaling (batch={batch_size})")
-    print(f"  {'Workers':>8} {'Avg ms':>10} {'Throughput':>12} {'Speedup':>10}")
+def bench_prefetch_threaded(mgr, spec, batch_sizes, max_rows, num_iters=10,
+                            num_threads=4):
+    """Full Engram prefetch with parallel table reads."""
+    print(f"\n[Bench 4] Threaded Prefetch ({num_threads} threads)")
+    print(f"  {'Batch':>8} {'Data':>10} {'Avg ms':>10} {'Throughput':>12}")
     print("  " + "-" * 45)
 
-    base_throughput = None
-    for n in range(1, len(hosts) + 1):
-        clients = [create_kv_client(hosts[i], ports[i], use_mock, use_ipc) for i in range(n)]
+    executor = ThreadPoolExecutor(max_workers=num_threads)
 
-        # Load tables to this subset (simplified: all to each)
-        for c in clients:
-            generate_and_load_tables(c, spec, max_rows_per_table=max_rows)
-
-        # Measure with round-robin across clients
+    for bs in batch_sizes:
         latencies = []
-        for it in range(num_iters):
-            client = clients[it % n]
-            indices = simulate_ngram_indices(batch_size, spec, max_rows)
-            _, elapsed = prefetch_from_pool(client, indices, spec)
-            latencies.append(elapsed * 1000)
-
-        avg_ms = np.mean(latencies)
-        data_kb = spec.bytes_per_token_total * batch_size / 1024
-        throughput = (data_kb / 1024) / (avg_ms / 1000) if avg_ms > 0 else 0
-
-        if base_throughput is None:
-            base_throughput = throughput
-        speedup = throughput / base_throughput if base_throughput > 0 else 1
-
-        print(f"  {n:>8} {avg_ms:>9.2f} {throughput:>9.1f} MB/s {speedup:>9.2f}x")
-
-
-def bench_packet_size_breakdown(
-    client, num_iters=200
-):
-    """Raw latency vs value size (like paper's Figure: CXL vs RDMA)."""
-    print("\n[Bench 4] Raw Read Latency vs Packet Size")
-    print(f"  {'Size':>10} {'Avg us':>10} {'P99 us':>10} {'Throughput':>12}")
-    print("  " + "-" * 48)
-
-    sizes = [64, 256, 512, 1024, 2048, 4096, 8192, 16384, 65536]
-
-    for size in sizes:
-        key = f"bench:raw:{size}"
-        val = bytes(np.random.bytes(size))
-        client.mset([key], [val])
-
-        # Warmup
-        for _ in range(5):
-            client.get([key])
-
-        lats = []
         for _ in range(num_iters):
             t0 = time.perf_counter()
-            client.get([key])
-            lats.append((time.perf_counter() - t0) * 1e6)
+            futures = []
+            for t in range(spec.num_tables):
+                rids = np.random.randint(0, max_rows, size=bs)
+                futures.append(executor.submit(mgr.read_rows, t, rids))
+            for f in futures:
+                f.result()
+            elapsed = (time.perf_counter() - t0) * 1000
+            latencies.append(elapsed)
 
-        avg = np.mean(lats)
-        p99 = np.percentile(lats, 99)
-        tp = (size / 1e6) / (avg / 1e6) if avg > 0 else 0
+        avg_ms = np.mean(latencies)
+        data_kb = spec.bytes_per_token_total * bs / 1024
+        tp = (data_kb / 1024) / (avg_ms / 1000) if avg_ms > 0 else 0
+        print(f"  {bs:>8} {data_kb:>8.1f}KB {avg_ms:>9.2f} {tp:>9.1f} MB/s")
 
-        if size >= 1024:
-            label = f"{size//1024} KB"
-        else:
-            label = f"{size} B"
+    executor.shutdown(wait=False)
 
-        print(f"  {label:>10} {avg:>9.1f} {p99:>9.1f} {tp:>9.1f} MB/s")
+
+def bench_overlap(mgr, spec, max_rows, compute_ms=5.0, batch_size=128,
+                  num_iters=10):
+    """Measure prefetch + compute overlap efficiency."""
+    print(f"\n[Bench 5] Overlap Efficiency (batch={batch_size}, compute={compute_ms}ms)")
+
+    # Standalone prefetch time
+    prefetch_times = []
+    for _ in range(num_iters):
+        t0 = time.perf_counter()
+        for t in range(spec.num_tables):
+            rids = np.random.randint(0, max_rows, size=batch_size)
+            mgr.read_rows(t, rids)
+        prefetch_times.append((time.perf_counter() - t0) * 1000)
+    avg_prefetch = np.mean(prefetch_times)
+
+    # Overlapped
+    pool = ThreadPoolExecutor(max_workers=1)
+    overlap_times = []
+    for _ in range(num_iters):
+        t0 = time.perf_counter()
+        def do_prefetch():
+            for t in range(spec.num_tables):
+                rids = np.random.randint(0, max_rows, size=batch_size)
+                mgr.read_rows(t, rids)
+        fut = pool.submit(do_prefetch)
+        time.sleep(compute_ms / 1000.0)
+        fut.result()
+        overlap_times.append((time.perf_counter() - t0) * 1000)
+    pool.shutdown(wait=False)
+
+    avg_overlap = np.mean(overlap_times)
+    sequential = avg_prefetch + compute_ms
+    overhead = max(0, avg_overlap - compute_ms)
+    efficiency = 1.0 - overhead / avg_prefetch if avg_prefetch > 0 else 0
+
+    print(f"  Prefetch alone:    {avg_prefetch:>8.2f} ms")
+    print(f"  Compute alone:     {compute_ms:>8.2f} ms")
+    print(f"  Sequential (P+C):  {sequential:>8.2f} ms")
+    print(f"  Overlapped:        {avg_overlap:>8.2f} ms")
+    print(f"  Overhead:          {overhead:>8.2f} ms")
+    print(f"  Overlap efficiency:{efficiency:>8.1%}")
+    if avg_prefetch < compute_ms:
+        print("  => EXCELLENT: prefetch fully hidden behind compute")
+    elif efficiency > 0.8:
+        print("  => GOOD: prefetch mostly hidden")
+    elif efficiency > 0.5:
+        print("  => OK: partial overlap")
+    else:
+        print("  => POOR: prefetch dominates")
 
 
 # ---------------------------------------------------------------------------
@@ -445,99 +374,98 @@ def bench_packet_size_breakdown(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Engram E2E performance benchmark (UB/URMA vs CXL comparison)"
+        description="Engram E2E benchmark (shared memory vs KV baseline)"
     )
-    parser.add_argument("--mock", action="store_true",
-                        help="Use in-memory mock (no Worker needed)")
+    parser.add_argument("--mode", choices=["shm", "kv", "mock"], default="shm",
+                        help="shm=ObjectClient mmap (like CXL), kv=KVClient per-key, mock=in-memory")
     parser.add_argument("--ipc", action="store_true",
-                        help="Use IPC shared memory (same-node, enable_exclusive_connection)")
-    parser.add_argument("--hosts", default="127.0.0.1",
-                        help="Comma-separated Worker IPs")
-    parser.add_argument("--ports", default="18482",
-                        help="Comma-separated Worker ports")
-    # Engram model spec
+                        help="KV mode: use IPC instead of TCP")
+    parser.add_argument("--hosts", default="127.0.0.1")
+    parser.add_argument("--ports", default="18482")
     parser.add_argument("--model-dim", type=int, default=4096)
     parser.add_argument("--num-tables", type=int, default=12)
-    parser.add_argument("--total-size-gb", type=float, default=200.0,
-                        help="Target total Engram table size in GB (default 200 ≈ 100B bf16 params)")
-    parser.add_argument("--dtype", choices=["bf16", "fp32"], default="bf16")
-    parser.add_argument("--max-rows", type=int, default=50000,
-                        help="Cap rows per table for quick bench (0=full size, WARNING: 200GB)")
-    # Benchmark params
-    parser.add_argument("--batch-sizes", default="32,64,128,256",
-                        help="Comma-separated batch sizes")
-    parser.add_argument("--compute-ms", type=float, default=5.0,
-                        help="Simulated Transformer layer compute time (ms)")
+    parser.add_argument("--total-size-gb", type=float, default=200.0)
+    parser.add_argument("--max-rows", type=int, default=10000,
+                        help="Rows per table to actually load (caps memory use)")
+    parser.add_argument("--batch-sizes", default="32,64,128,256")
+    parser.add_argument("--compute-ms", type=float, default=5.0)
     parser.add_argument("--num-iters", type=int, default=10)
-    parser.add_argument("--skip-load", action="store_true",
-                        help="Skip table loading (assume already loaded)")
     parser.add_argument("--prefetch-threads", type=int, default=4)
     args = parser.parse_args()
 
-    hosts = [h.strip() for h in args.hosts.split(",")]
-    ports = [int(p.strip()) for p in args.ports.split(",")]
+    host = args.hosts.split(",")[0].strip()
+    port = int(args.ports.split(",")[0].strip())
     batch_sizes = [int(b) for b in args.batch_sizes.split(",")]
 
     spec = EngramModelSpec(
         model_dim=args.model_dim,
         num_tables=args.num_tables,
         total_size_gb=args.total_size_gb,
-        dtype_bytes=2 if args.dtype == "bf16" else 4,
     )
 
     print("=" * 60)
     print("Engram E2E Performance Benchmark")
     print("=" * 60)
-    mode_str = "MOCK (in-memory)" if args.mock else ("LIVE IPC (shared memory)" if args.ipc else "LIVE TCP")
-    print(f"Mode:      {mode_str}")
-    print(f"Workers:   {', '.join(f'{h}:{p}' for h,p in zip(hosts, ports))}")
+    mode_labels = {"shm": "SHM (ObjectClient mmap, like CXL)",
+                   "kv": f"KV ({'IPC' if args.ipc else 'TCP'})",
+                   "mock": "MOCK (in-memory numpy)"}
+    print(f"Mode:      {mode_labels[args.mode]}")
+    print(f"Worker:    {host}:{port}")
     print(f"{spec.summary()}")
-    print(f"Compute:   {args.compute_ms} ms (simulated Transformer layer)")
+    print(f"Max rows:  {args.max_rows:,} per table")
+    print(f"Compute:   {args.compute_ms} ms (simulated)")
     print("=" * 60)
 
-    # Connect
-    client = create_kv_client(hosts[0], ports[0], args.mock, args.ipc)
+    # Create manager
+    if args.mode == "shm":
+        mgr = ShmTableManager(host, port, use_mock=False)
+    elif args.mode == "mock":
+        mgr = ShmTableManager(host, port, use_mock=True)
+    else:
+        mgr = KVTableManager(host, port, use_ipc=args.ipc)
+
+    mgr.initialize()
 
     # Load tables
-    if not args.skip_load:
-        if args.max_rows > 0:
-            print(f"\n[Setup] Loading Engram tables (capped at {args.max_rows:,} rows/table for quick bench)...")
-        else:
-            print(f"\n[Setup] Loading FULL Engram tables ({spec.total_gb():.0f} GB, this may take a while)...")
-        generate_and_load_tables(client, spec, max_rows_per_table=args.max_rows)
-    else:
-        print("\n[Setup] Skipping table load (--skip-load)")
+    max_rows = args.max_rows
+    print(f"\n[Setup] Loading {spec.num_tables} tables ({max_rows:,} rows each)...")
+    t0 = time.perf_counter()
+    for t in range(spec.num_tables):
+        full_rows = spec.table_rows(t)
+        nrows = min(full_rows, max_rows) if max_rows > 0 else full_rows
+        mgr.load_table(t, nrows, spec.oe_hidden_dim)
+        elapsed = time.perf_counter() - t0
+        mb = nrows * spec.bytes_per_row / 1e6
+        print(f"  Table {t:2d}: {nrows:,} rows = {mb:.1f} MB [{elapsed:.1f}s]", flush=True)
 
-    # Prefetch thread pool (simulates multi-table parallel fetch)
-    executor = ThreadPoolExecutor(max_workers=args.prefetch_threads)
+    # Open buffers (for SHM mode, maps shared memory)
+    for t in range(spec.num_tables):
+        mgr.open_table(t)
+
+    total_mb = spec.num_tables * max_rows * spec.bytes_per_row / 1e6
+    print(f"  Total loaded: {total_mb:.0f} MB in {time.perf_counter()-t0:.1f}s")
+    print(f"  Full Engram (uncapped): {spec.total_gb():.0f} GB")
 
     # Run benchmarks
-    bench_packet_size_breakdown(client, num_iters=args.num_iters * 20)
+    bench_single_read_latency(mgr, spec, max_rows, num_iters=args.num_iters * 50)
 
-    bench_prefetch_latency(
-        client, spec, batch_sizes, args.num_iters, executor,
-        max_rows=args.max_rows,
-    )
+    bench_batch_read_latency(mgr, spec, max_rows, num_iters=args.num_iters * 5)
 
-    bench_overlap_efficiency(
-        client, spec, batch_size=128,
-        compute_ms=args.compute_ms, num_iters=args.num_iters,
-        executor=executor, max_rows=args.max_rows,
-    )
+    bench_prefetch_latency(mgr, spec, batch_sizes, max_rows, args.num_iters)
 
-    if len(hosts) > 1 and not args.mock:
-        bench_scaling(hosts, ports, spec, batch_size=128,
-                      num_iters=args.num_iters, use_mock=args.mock,
-                      max_rows=args.max_rows)
+    bench_prefetch_threaded(mgr, spec, batch_sizes, max_rows, args.num_iters,
+                            args.prefetch_threads)
 
-    executor.shutdown(wait=False)
+    bench_overlap(mgr, spec, max_rows, args.compute_ms, batch_size=128,
+                  num_iters=args.num_iters)
+
+    mgr.shutdown()
 
     print("\n" + "=" * 60)
-    print("Benchmark complete.")
-    print("Compare results with paper Table 1:")
-    print(f"  Paper (CXL):  1-7% throughput loss vs DRAM")
-    print(f"  Paper (RDMA): <25% peak BW for 64B messages")
-    print(f"  This (URMA):  see results above")
+    print("Compare with paper (arXiv:2603.10087):")
+    print("  CXL read latency:  ~0.2 us (load/store)")
+    print("  CXL prefetch 128t: <1 ms")
+    print("  CXL throughput:    1-7% loss vs DRAM")
     print("=" * 60)
 
 
