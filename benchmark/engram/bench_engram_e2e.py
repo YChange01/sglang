@@ -142,11 +142,14 @@ class MockKVClient:
 #  Table generation & loading
 # ---------------------------------------------------------------------------
 
-def create_kv_client(host, port, use_mock=False):
+def create_kv_client(host, port, use_mock=False, use_ipc=False):
     if use_mock:
         return MockKVClient()
     from yr.datasystem import KVClient
-    client = KVClient(host=host, port=port, timeout_ms=60000, req_timeout_ms=10000)
+    client = KVClient(
+        host=host, port=port, timeout_ms=60000, req_timeout_ms=10000,
+        enable_exclusive_connection=use_ipc,
+    )
     client.init()
     return client
 
@@ -365,7 +368,7 @@ def bench_overlap_efficiency(
 
 def bench_scaling(
     hosts, ports, spec: EngramModelSpec, batch_size=128,
-    num_iters=10, use_mock=False, max_rows=0
+    num_iters=10, use_mock=False, max_rows=0, use_ipc=False
 ):
     """Measure throughput scaling with multiple Workers."""
     print(f"\n[Bench 3] Multi-Worker Scaling (batch={batch_size})")
@@ -374,7 +377,7 @@ def bench_scaling(
 
     base_throughput = None
     for n in range(1, len(hosts) + 1):
-        clients = [create_kv_client(hosts[i], ports[i], use_mock) for i in range(n)]
+        clients = [create_kv_client(hosts[i], ports[i], use_mock, use_ipc) for i in range(n)]
 
         # Load tables to this subset (simplified: all to each)
         for c in clients:
@@ -446,6 +449,8 @@ def main():
     )
     parser.add_argument("--mock", action="store_true",
                         help="Use in-memory mock (no Worker needed)")
+    parser.add_argument("--ipc", action="store_true",
+                        help="Use IPC shared memory (same-node, enable_exclusive_connection)")
     parser.add_argument("--hosts", default="127.0.0.1",
                         help="Comma-separated Worker IPs")
     parser.add_argument("--ports", default="18482",
@@ -483,14 +488,15 @@ def main():
     print("=" * 60)
     print("Engram E2E Performance Benchmark")
     print("=" * 60)
-    print(f"Mode:      {'MOCK (in-memory)' if args.mock else 'LIVE (UB/URMA)'}")
+    mode_str = "MOCK (in-memory)" if args.mock else ("LIVE IPC (shared memory)" if args.ipc else "LIVE TCP")
+    print(f"Mode:      {mode_str}")
     print(f"Workers:   {', '.join(f'{h}:{p}' for h,p in zip(hosts, ports))}")
     print(f"{spec.summary()}")
     print(f"Compute:   {args.compute_ms} ms (simulated Transformer layer)")
     print("=" * 60)
 
     # Connect
-    client = create_kv_client(hosts[0], ports[0], args.mock)
+    client = create_kv_client(hosts[0], ports[0], args.mock, args.ipc)
 
     # Load tables
     if not args.skip_load:
