@@ -126,7 +126,7 @@ int main(int argc, char *argv[])
     /* 6. verify pattern through the imported VA. If this passes, obmm
      *    really mapped the same backing pages (or copies of them) and
      *    the UAPI is usable. */
-    int errors = check_pattern((volatile uint32_t*)imported, n_pattern_words);
+    int errors = check_pattern((const volatile uint32_t*)imported, n_pattern_words);
     if (errors == 0) {
         printf("  [PASS] 1 KB pattern matches via imported VA\n");
     } else {
@@ -158,8 +158,14 @@ int main(int argc, char *argv[])
     munmap(va, length);
     obmm_rw_close(ctx);
 
-    printf("\n  === smoke test PASSED ===\n");
-    return (errors == 0) ? 0 : 2;
+    if (errors == 0) {
+        printf("\n  === smoke test PASSED ===\n");
+        return 0;
+    } else {
+        fprintf(stderr, "\n  === smoke test FAILED (%d pattern mismatches) ===\n",
+                errors);
+        return 2;
+    }
 
 fail_unexport:
     (void)obmm_rw_unexport(ctx, &handle);

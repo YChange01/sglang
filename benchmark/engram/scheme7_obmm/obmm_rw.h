@@ -61,7 +61,17 @@ extern "C" {
  * can map the remote memory. It is self-contained: send these bytes
  * over TCP, pass to obmm_rw_import on the peer.
  *
- * 80 bytes, packed for wire stability. */
+ * Layout (packed, total 72 bytes):
+ *   0   mem_id     u64
+ *   8   length     u64
+ *   16  uba        u64
+ *   24  tokenid    u32
+ *   28  scna       u32
+ *   32  seid       u8[16]
+ *   48  deid       u8[16]
+ *   64  pxm_numa   s32
+ *   68  base_dist  u8
+ *   69  reserved   u8[3] */
 typedef struct {
     uint64_t mem_id;       /* output of export, input of import */
     uint64_t length;       /* byte length of the exported region */
