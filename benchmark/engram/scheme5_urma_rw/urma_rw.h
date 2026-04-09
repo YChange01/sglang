@@ -13,6 +13,19 @@
  *           posts READ work requests to fetch specific rows
  *
  * Build: see Makefile (links against liburma.so)
+ *
+ * Thread safety:
+ *   A urma_rw_ctx_t is NOT thread-safe. The internal jetty / completion queue
+ *   can only be driven from a single producer thread at a time. If you need
+ *   parallel readers, create one context per thread.
+ *
+ * Wire protocol limits:
+ *   The TCP seg/jetty exchange sends a packed C struct containing raw SDK
+ *   types (urma_eid_t, urma_jetty_id_t). This assumes:
+ *     1. Server and client are the same endian (true for aarch64↔aarch64)
+ *     2. Server and client use the same umdk SDK version (struct layout)
+ *   Do not use across heterogeneous hardware or SDK versions without
+ *   introducing explicit marshalling.
  */
 
 #ifndef URMA_RW_H

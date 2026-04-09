@@ -16,6 +16,10 @@
 #include <unistd.h>
 #include <time.h>
 
+/* Max batch size used by bench_batch_read. Must be >= max(batches[]) below.
+ * Kept as a static cap so fixed-size stack arrays below are sized correctly. */
+#define MAX_BENCH_BATCH 256
+
 static double diff_us(struct timespec* a, struct timespec* b)
 {
     return (b->tv_sec - a->tv_sec) * 1e6 + (b->tv_nsec - a->tv_nsec) / 1e3;
@@ -68,9 +72,14 @@ static void bench_batch_read(urma_rw_ctx_t* ctx, int num_rows, int dim,
 
     for (int b = 0; b < 4; b++) {
         int batch = batches[b];
-        uint64_t locals[256];
-        uint64_t remotes[256];
-        uint32_t lens[256];
+        if (batch > MAX_BENCH_BATCH) {
+            fprintf(stderr, "batch %d exceeds MAX_BENCH_BATCH=%d, skipping\n",
+                    batch, MAX_BENCH_BATCH);
+            continue;
+        }
+        uint64_t locals[MAX_BENCH_BATCH];
+        uint64_t remotes[MAX_BENCH_BATCH];
+        uint32_t lens[MAX_BENCH_BATCH];
         for (int i = 0; i < batch; i++) lens[i] = row_bytes;
 
         struct timespec t0, t1;
@@ -186,7 +195,7 @@ int main(int argc, char* argv[])
     }
 
     const char* server_ip = argv[1];
-    uint16_t port = (argc > 2) ? (uint16_t)atoi(argv[2]) : 13857;
+    uint16_t port = (argc > 2) ? (uint16_t)atoi(argv[2]) : URMA_RW_DEFAULT_PORT;
     int num_rows = (argc > 3) ? atoi(argv[3]) : 10000;
     int dim = (argc > 4) ? atoi(argv[4]) : 341;
     int num_iters = (argc > 5) ? atoi(argv[5]) : 200;

@@ -22,7 +22,11 @@
 #define PAGE_SIZE 4096
 #endif
 #define JETTY_DEPTH 8192  /* > URMA_RW_MAX_BATCH(4096) for headroom */
-#define MAX_POLL_TRY 1000000       /* ~1 second with 1us sleep */
+/* Pure spin — no sleep. On a modern aarch64 core this bounds a poll to a few
+ * seconds of wall time (dominated by urma_poll_jfc overhead per call). Sized
+ * generously so genuine completions are never lost under load, but low enough
+ * to surface true hangs within a reasonable time. */
+#define MAX_POLL_TRY 10000000
 #define DEFAULT_TOKEN 0xACFE
 
 #define LOG_ERR(fmt, ...) \
@@ -149,6 +153,13 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
     if (eids && eid_cnt > 0) {
         eid_idx = eids[0].eid_index;
         urma_free_eid_list(eids);
+    } else {
+        /* No eids visible — fall back to index 0, but warn loudly. Typically
+         * means the device has no route configured, and create_context will
+         * fail below with a cryptic message. */
+        LOG_ERR("urma_get_eid_list returned %u entries; falling back to eid_idx=0",
+                eid_cnt);
+        if (eids) urma_free_eid_list(eids);
     }
 
     /* Create context */
@@ -275,6 +286,13 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
     return ctx;
 
 FREE_BUF:
+    /* Free batch work buffers first (free(NULL) is safe, so partial-alloc
+     * and already-NULL cases both work). Then the data buffer. */
+    free(ctx->batch_src_sges);
+    free(ctx->batch_dst_sges);
+    free(ctx->batch_src_sgs);
+    free(ctx->batch_dst_sgs);
+    free(ctx->batch_wrs);
     free(ctx->buf);
 DEL_JETTY:
     urma_delete_jetty(ctx->jetty);
@@ -342,11 +360,16 @@ static int sock_send_all(int fd, const void* buf, size_t size)
     size_t done = 0;
     while (done < size) {
         ssize_t w = write(fd, p + done, size - done);
-        if (w <= 0) {
+        if (w < 0) {
+            if (errno == EINTR) continue;
             LOG_ERR("sock_send_all: %s", strerror(errno));
             return -1;
         }
-        done += w;
+        if (w == 0) {
+            LOG_ERR("sock_send_all: peer closed");
+            return -1;
+        }
+        done += (size_t)w;
     }
     return 0;
 }
@@ -357,11 +380,16 @@ static int sock_recv_all(int fd, void* buf, size_t size)
     size_t done = 0;
     while (done < size) {
         ssize_t r = read(fd, p + done, size - done);
-        if (r <= 0) {
+        if (r < 0) {
+            if (errno == EINTR) continue;
             LOG_ERR("sock_recv_all: %s", strerror(errno));
             return -1;
         }
-        done += r;
+        if (r == 0) {
+            LOG_ERR("sock_recv_all: peer closed (EOF)");
+            return -1;
+        }
+        done += (size_t)r;
     }
     return 0;
 }
@@ -505,8 +533,13 @@ int urma_rw_client_connect(urma_rw_ctx_t* ctx, const char* server_ip, uint16_t p
     struct sockaddr_in addr = {
         .sin_family = AF_INET,
         .sin_port = htons(port),
-        .sin_addr.s_addr = inet_addr(server_ip),
     };
+    if (inet_pton(AF_INET, server_ip, &addr.sin_addr) != 1) {
+        LOG_ERR("invalid server IP: %s", server_ip);
+        close(ctx->client_fd);
+        ctx->client_fd = -1;
+        return URMA_RW_ERR_SOCKET;
+    }
     LOG_INFO("Connecting to %s:%u...", server_ip, port);
     if (connect(ctx->client_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
         LOG_ERR("connect: %s", strerror(errno));
@@ -571,30 +604,6 @@ static int poll_completion(urma_rw_ctx_t* ctx, uint64_t expected_rid)
     LOG_ERR("poll_completion timeout waiting for rid=%lu",
             (unsigned long)expected_rid);
     return -1;
-}
-
-static int poll_n_completions(urma_rw_ctx_t* ctx, uint32_t n)
-{
-    urma_cr_t cr;
-    uint32_t done = 0;
-    int tries = 0;
-    while (done < n && tries < MAX_POLL_TRY) {
-        int got = urma_poll_jfc(ctx->jfc, 1, &cr);
-        if (got < 0) {
-            LOG_ERR("urma_poll_jfc: %d", got);
-            return -1;
-        }
-        if (got > 0) {
-            if (cr.status != URMA_CR_SUCCESS) {
-                LOG_ERR("CR failed: status=%d", cr.status);
-                return -1;
-            }
-            done++;
-        } else {
-            tries++;
-        }
-    }
-    return (done == n) ? 0 : -1;
 }
 
 int urma_rw_read(urma_rw_ctx_t* ctx, uint64_t local_offset,
@@ -684,6 +693,11 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
     urma_sg_t*  dst_sgs  = ctx->batch_dst_sgs;
     urma_jfs_wr_t* wrs   = ctx->batch_wrs;
 
+    /* Reserve a contiguous rid range for the whole batch. The last WR's rid
+     * is what we'll match against in the completion below. */
+    uint64_t base_rid = __atomic_fetch_add(&ctx->rid, count, __ATOMIC_RELAXED);
+    uint64_t last_rid = base_rid + (count - 1);
+
     for (uint32_t i = 0; i < count; i++) {
         src_sges[i].addr = ctx->remote_tseg->seg.ubva.va + remote_offsets[i];
         src_sges[i].len = lens[i];
@@ -704,7 +718,7 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
          * per batch, avoiding hardware coalescing ambiguity. */
         wrs[i].flag.bs.complete_enable = (i == count - 1) ? 1 : 0;
         wrs[i].tjetty = ctx->remote_tjetty;
-        wrs[i].user_ctx = __atomic_fetch_add(&ctx->rid, 1, __ATOMIC_RELAXED);
+        wrs[i].user_ctx = base_rid + i;
         wrs[i].rw.src = src_sgs[i];
         wrs[i].rw.dst = dst_sgs[i];
         wrs[i].next = (i + 1 < count) ? &wrs[i + 1] : NULL;
@@ -716,7 +730,9 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
         return URMA_RW_ERR_POST;
     }
 
-    /* Wait for the single completion (only the last WR had complete_enable=1) */
+    /* Wait for the single completion (only the last WR had complete_enable=1).
+     * Verify the CQE's user_ctx matches last_rid so we don't silently consume
+     * a stale entry from a prior operation. */
     urma_cr_t cr = {0};
     int tries = 0;
     while (tries < MAX_POLL_TRY) {
@@ -727,13 +743,20 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
         }
         if (got > 0) {
             if (cr.status != URMA_CR_SUCCESS) {
-                LOG_ERR("batch CR failed: status=%d", cr.status);
+                LOG_ERR("batch CR failed: status=%d, rid=%lu",
+                        cr.status, (unsigned long)cr.user_ctx);
+                return URMA_RW_ERR_POLL;
+            }
+            if ((uint64_t)cr.user_ctx != last_rid) {
+                LOG_ERR("batch CR rid mismatch: got %lu, want %lu",
+                        (unsigned long)cr.user_ctx, (unsigned long)last_rid);
                 return URMA_RW_ERR_POLL;
             }
             return URMA_RW_OK;
         }
         tries++;
     }
-    LOG_ERR("batch completion timeout");
+    LOG_ERR("batch completion timeout (last_rid=%lu)",
+            (unsigned long)last_rid);
     return URMA_RW_ERR_POLL;
 }

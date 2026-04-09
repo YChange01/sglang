@@ -3,7 +3,8 @@
  *
  * Usage:
  *   ./server [port] [total_size_mb]
- *   Default: port=13857, total_size_mb=2048 (2GB, enough for ~10000 rows x 12 tables)
+ *   Default: port=URMA_RW_DEFAULT_PORT, total_size_mb=2048 (2GB, enough for
+ *            ~10000 rows x 12 tables)
  */
 
 #define _GNU_SOURCE
@@ -25,7 +26,7 @@ static void sigint_handler(int sig)
 
 int main(int argc, char* argv[])
 {
-    uint16_t port = 13857;
+    uint16_t port = URMA_RW_DEFAULT_PORT;
     uint64_t total_mb = 2048;  /* 2 GB */
 
     if (argc > 1) port = (uint16_t)atoi(argv[1]);
@@ -54,10 +55,10 @@ int main(int argc, char* argv[])
     }
 
     printf("Sample values:\n");
-    printf("  data[0]      = %.6f\n", data[0]);
-    printf("  data[42]     = %.6f\n", data[42]);
-    printf("  data[1000]   = %.6f\n", data[1000]);
-    printf("  data[100000] = %.6f\n", data[100000]);
+    if (num_floats > 0)      printf("  data[0]      = %.6f\n", data[0]);
+    if (num_floats > 42)     printf("  data[42]     = %.6f\n", data[42]);
+    if (num_floats > 1000)   printf("  data[1000]   = %.6f\n", data[1000]);
+    if (num_floats > 100000) printf("  data[100000] = %.6f\n", data[100000]);
 
     signal(SIGINT, sigint_handler);
 
