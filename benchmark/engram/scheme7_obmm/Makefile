@@ -23,15 +23,16 @@ LDFLAGS  =
 LIB_SRCS = obmm_rw.c
 LIB_OBJS = $(LIB_SRCS:.c=.o)
 
-BINS = smoke_test smoke_multi
+BINS = smoke_test smoke_multi smoke_export
 
 .PHONY: all clean help
 
 all: $(BINS)
 	@echo
 	@echo "Built: $(BINS)"
-	@echo "Next:  sudo ./smoke_test        # single configuration"
-	@echo "       sudo ./smoke_multi       # 11 variants to diagnose EINVAL"
+	@echo "Next:  sudo ./smoke_export      # probe mmap offset convention (RUN THIS FIRST)"
+	@echo "       sudo ./smoke_multi       # 11-variant sanity check"
+	@echo "       sudo ./smoke_test        # end-to-end single-path test"
 
 smoke_test: smoke_test.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_test.c $(LIB_OBJS) $(LDFLAGS)
@@ -39,6 +40,10 @@ smoke_test: smoke_test.c $(LIB_OBJS)
 
 smoke_multi: smoke_multi.c $(LIB_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_multi.c $(LIB_OBJS) $(LDFLAGS)
+	@echo "Built $@"
+
+smoke_export: smoke_export.c $(LIB_OBJS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_export.c $(LIB_OBJS) $(LDFLAGS)
 	@echo "Built $@"
 
 %.o: %.c obmm_rw.h
