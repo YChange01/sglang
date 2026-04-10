@@ -308,12 +308,17 @@ int main(int argc, char *argv[])
     if (fd_ctl < 0) { perror("[2] open /dev/obmm"); return 1; }
     printf("[2] /dev/obmm fd_ctl=%d\n", fd_ctl);
 
-    /* 3. IMPORT. Flags: ALLOW_MMAP (mandatory for shmdev mmap) +
-     *    NUMA_REMOTE (tells kernel this is a cross-node import and
-     *    must go through UBMMU to reach a remote UB endpoint). */
+    /* 3. IMPORT. Kernel requires EXACTLY ONE of {ALLOW_MMAP, NUMA_REMOTE}.
+     *    For cross-node: use NUMA_REMOTE alone. The shmdev created after
+     *    IMPORT inherits mmap capability from the exporter's ALLOW_MMAP
+     *    flag — we don't need to re-request it here.
+     *
+     *    dmesg on failure with both flags set:
+     *      "Exactly one of {ALLOW_MMAP, NUMA_REMOTE} must be specified"
+     */
     struct obmm_cmd_import imp;
     memset(&imp, 0, sizeof(imp));
-    imp.flags    = OBMM_IMPORT_FLAG_ALLOW_MMAP | OBMM_IMPORT_FLAG_NUMA_REMOTE;
+    imp.flags    = OBMM_IMPORT_FLAG_NUMA_REMOTE;
     imp.addr     = wire.uba;
     imp.length   = wire.length;
     imp.tokenid  = wire.tokenid;
