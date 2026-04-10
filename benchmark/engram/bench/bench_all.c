@@ -41,8 +41,8 @@
 #include <arpa/inet.h>
 #include <ubs_mem.h>
 
-/* URMA RW library from scheme5 */
-#include "urma_rw.h"
+/* URMA RW library */
+#include "../lib/urma_rw.h"
 
 #define NUM_TABLES 12
 #define DEFAULT_TCP_PORT  13900
