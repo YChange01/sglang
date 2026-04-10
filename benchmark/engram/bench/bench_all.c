@@ -420,7 +420,7 @@ static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
 #define PAPER_SEG_FLOATS      (PAPER_SEG_BYTES / (int)sizeof(float))  /* 80 */
 
 static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
-                                    int count, size_t data_size)
+                                    int count)
 {
     switch (ctx->mode) {
     case MODE_LOCAL:
@@ -495,7 +495,7 @@ static void bench_paper_27b(bench_ctx_t *ctx, size_t data_size, int num_iters)
                              * PAPER_SEG_BYTES;
             }
             clock_gettime(CLOCK_MONOTONIC, &t0);
-            bench_paper_read_batch(ctx, offsets, total_segs, data_size);
+            bench_paper_read_batch(ctx, offsets, total_segs);
             clock_gettime(CLOCK_MONOTONIC, &t1);
             total_us += diff_us(&t0, &t1);
         }
