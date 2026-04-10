@@ -177,6 +177,22 @@ static int bench_read_row(bench_ctx_t *ctx, int row, int dim)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Engram-27B constants and read helper                              */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Engram-27B parameters (arXiv:2603.10087):
+ *   vocab_size = 2,262,400; emb_dim = 1,280
+ *   Per token: 8 hash-mapped segments, each 320 bytes, sparse addresses
+ */
+#define PAPER_SEGS_PER_TOKEN  8
+#define PAPER_SEG_BYTES       320
+#define PAPER_SEG_FLOATS      (PAPER_SEG_BYTES / (int)sizeof(float))  /* 80 */
+
+static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
+                                    int count);
+
+/* ------------------------------------------------------------------ */
 /*  Benchmarks                                                        */
 /* ------------------------------------------------------------------ */
 
@@ -219,22 +235,32 @@ static void bench_single_load(bench_ctx_t *ctx, int num_rows, int dim,
     free(indices);
 }
 
-static void bench_single_row(bench_ctx_t *ctx, int num_rows, int dim,
-                              int num_iters)
+static void bench_single_seg(bench_ctx_t *ctx, size_t data_size, int num_iters)
 {
-    int row_bytes = dim * (int)sizeof(float);
-    printf("\n  [Single-row read] %d bytes, %d iters\n", row_bytes, num_iters);
+    printf("\n  [Single-seg read] %d bytes, %d iters\n", PAPER_SEG_BYTES, num_iters);
 
-    for (int i = 0; i < 10; i++) bench_read_row(ctx, i % num_rows, dim);
+    uint64_t max_offset = data_size - PAPER_SEG_BYTES;
+
+    /* Warmup */
+    uint64_t off0 = 0;
+    for (int i = 0; i < 10; i++) {
+        bench_paper_read_batch(ctx, &off0, 1);
+        off0 = (off0 + PAPER_SEG_BYTES) % max_offset;
+    }
+
+    /* Pre-generate random offsets */
+    uint64_t *offsets = (uint64_t *)malloc(num_iters * sizeof(uint64_t));
+    if (!offsets) return;
+    srand(42);
+    for (int i = 0; i < num_iters; i++)
+        offsets[i] = ((uint64_t)(rand() % (int)(max_offset / PAPER_SEG_BYTES))) * PAPER_SEG_BYTES;
 
     struct timespec t0, t1;
     double total_us = 0, min_us = 1e9, max_us = 0;
 
-    srand(42);
     for (int i = 0; i < num_iters; i++) {
-        int row = rand() % num_rows;
         clock_gettime(CLOCK_MONOTONIC, &t0);
-        bench_read_row(ctx, row, dim);
+        bench_paper_read_batch(ctx, &offsets[i], 1);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double us = diff_us(&t0, &t1);
         total_us += us;
@@ -244,7 +270,8 @@ static void bench_single_row(bench_ctx_t *ctx, int num_rows, int dim,
 
     double avg = total_us / num_iters;
     printf("    Avg: %.3f us, Min: %.3f us, Max: %.3f us\n", avg, min_us, max_us);
-    printf("    Throughput: %.1f MB/s\n", (double)row_bytes / avg);
+    printf("    Throughput: %.1f MB/s\n", (double)PAPER_SEG_BYTES / avg);
+    free(offsets);
 }
 
 static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
@@ -285,18 +312,8 @@ static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
 }
 
 /* ------------------------------------------------------------------ */
-/*  Paper reproduction: Engram-27B (arXiv:2603.10087 Figure 3/5)      */
+/*  Engram-27B batch read implementation                              */
 /* ------------------------------------------------------------------ */
-
-/*
- * Engram-27B parameters:
- *   vocab_size = 2,262,400; emb_dim = 1,280
- *   Per token: 8 hash-mapped segments, each 320 bytes, sparse addresses
- *   Batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
- */
-#define PAPER_SEGS_PER_TOKEN  8
-#define PAPER_SEG_BYTES       320
-#define PAPER_SEG_FLOATS      (PAPER_SEG_BYTES / (int)sizeof(float))  /* 80 */
 
 static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
                                     int count)
@@ -349,10 +366,10 @@ static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
 
 static void bench_paper_27b(bench_ctx_t *ctx, size_t data_size, int num_iters)
 {
-    int batch_sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
-    int nbatches = 13;
+    int batch_sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384};
+    int nbatches = 15;
 
-    printf("\n  [Paper: Engram-27B] 8 segs x 320B per token, sparse\n");
+    printf("\n  [Engram-27B] 8 segs x 320B per token, sparse\n");
     printf("    %-8s %-8s %-10s %-12s %-12s\n",
            "Batch", "Reads", "Data", "Latency", "Throughput");
     printf("    -----------------------------------------------------------\n");
@@ -419,9 +436,10 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
                actual, expected, fabsf(actual - expected) < 0.01f ? "OK" : "MISMATCH");
     }
 
+    size_t data_size = (size_t)num_rows * dim * sizeof(float);
     bench_single_load(ctx, num_rows, dim, num_iters);
-    bench_single_row(ctx, num_rows, dim, num_iters);
-    bench_paper_27b(ctx, (size_t)num_rows * dim * sizeof(float), num_iters);
+    bench_single_seg(ctx, data_size, num_iters);
+    bench_paper_27b(ctx, data_size, num_iters);
     bench_cold_hot(ctx, num_rows, dim);
 }
 
@@ -562,8 +580,8 @@ int main(int argc, char *argv[])
 
     size_t buf_size = size_mb * 1024 * 1024;
     int row_bytes = dim * (int)sizeof(float);
-    /* Max paper batch: 4096 tokens × 8 segs × 320B = 10 MB */
-    size_t local_buf_size = (size_t)4096 * PAPER_SEGS_PER_TOKEN * PAPER_SEG_BYTES;
+    /* Max batch: 16384 tokens × 8 segs × 320B = 40 MB */
+    size_t local_buf_size = (size_t)16384 * PAPER_SEGS_PER_TOKEN * PAPER_SEG_BYTES;
     if (local_buf_size < buf_size) local_buf_size = buf_size;
 
     printf("=== Unified Cross-Node Benchmark ===\n");
