@@ -82,14 +82,29 @@ case "${1:-help}" in
             "$@"
         ;;
 
+    e2e)
+        shift
+        CMD=${1:-retrieval}
+        shift 2>/dev/null || true
+        echo "=== E2E Benchmark: $CMD ==="
+        export SERVER_IP TCP_PORT URMA_PORT
+        export PROVIDER_HOST=$PROVIDER
+        export SHM_NAME
+        python3 e2e/bench_e2e.py "$CMD" --server_ip $SERVER_IP "$@"
+        ;;
+
     help|*)
-        echo "Usage: $0 {server|bench|paper|all} [options]"
+        echo "Usage: $0 {server|bench|paper|e2e|all} [options]"
         echo ""
         echo "  server              Start unified server (Node1)"
-        echo "  bench [mode] [...]  Run benchmark (Node2)"
+        echo "  bench [mode] [...]  Run micro benchmark (Node2)"
         echo "    modes: local, tcp, urma, ubsmem, ubsmem-nc, ubsmem-huge, all"
         echo "  paper               Paper reproduction only"
-        echo "  all                 Full benchmark suite"
+        echo "  e2e [cmd] [...]     End-to-end benchmark (Node2)"
+        echo "    cmds: retrieval, table2, table3"
+        echo "    e.g.: ./run.sh e2e retrieval --all"
+        echo "          ./run.sh e2e table2 --all"
+        echo "  all                 Full micro benchmark suite"
         echo ""
         echo "Environment variables: NUMA_NODE, SIZE_MB, SHM_NAME, SERVER_IP,"
         echo "  TCP_PORT, URMA_PORT, PROVIDER"
