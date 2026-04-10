@@ -579,14 +579,14 @@ int main(int argc, char *argv[])
     }
 
     size_t buf_size = size_mb * 1024 * 1024;
-    int row_bytes = dim * (int)sizeof(float);
     /* Max batch: 16384 tokens × 8 segs × 320B = 40 MB */
     size_t local_buf_size = (size_t)16384 * PAPER_SEGS_PER_TOKEN * PAPER_SEG_BYTES;
     if (local_buf_size < buf_size) local_buf_size = buf_size;
 
     printf("=== Unified Cross-Node Benchmark ===\n");
     printf("Mode: %s\n", mode_str);
-    printf("Table: %d rows x %d dim = %d bytes/row\n", num_rows, dim, row_bytes);
+    printf("Table: %d rows x %d dim = %d bytes/row\n", num_rows, dim,
+           (int)(dim * sizeof(float)));
     printf("shmem: %s, size: %zu MB, iters: %d\n", shm_name, size_mb, num_iters);
     printf("server: %s, tcp:%u, urma:%u, provider: %s\n\n",
            server_ip, tcp_port, urma_port, provider_host);
