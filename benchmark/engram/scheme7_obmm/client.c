@@ -68,6 +68,25 @@ struct scheme7_wire_handle {
     uint8_t  deid[16];
 } __attribute__((packed));
 
+/*
+ * Read this node's primary CNA from sysfs.
+ */
+static uint32_t read_local_cna(void)
+{
+    const char *path = "/sys/devices/ub_bus_controller1/00002/primary_cna";
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[warn] cannot read %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    unsigned int cna = 0;
+    if (fscanf(f, "%x", &cna) != 1) {
+        fprintf(stderr, "[warn] failed to parse CNA from %s\n", path);
+    }
+    fclose(f);
+    return (uint32_t)cna;
+}
+
 /* ---------- utilities ---------- */
 
 static double diff_us(const struct timespec *a, const struct timespec *b)
@@ -303,18 +322,22 @@ int main(int argc, char *argv[])
                 wire.length, expected);
     }
 
-    /* 2. open /dev/obmm */
+    /* 2. open /dev/obmm + read local CNA */
     int fd_ctl = open("/dev/obmm", O_RDWR);
     if (fd_ctl < 0) { perror("[2] open /dev/obmm"); return 1; }
-    printf("[2] /dev/obmm fd_ctl=%d\n", fd_ctl);
+
+    uint32_t local_cna = read_local_cna();
+    printf("[2] /dev/obmm fd_ctl=%d, local CNA=0x%04x\n", fd_ctl, local_cna);
 
     /* 3. IMPORT. Kernel requires EXACTLY ONE of {ALLOW_MMAP, NUMA_REMOTE}.
-     *    For cross-node: use NUMA_REMOTE alone. The shmdev created after
-     *    IMPORT inherits mmap capability from the exporter's ALLOW_MMAP
-     *    flag — we don't need to re-request it here.
+     *    For cross-node: use NUMA_REMOTE alone.
      *
-     *    dmesg on failure with both flags set:
-     *      "Exactly one of {ALLOW_MMAP, NUMA_REMOTE} must be specified"
+     *    scna = server's CNA (source of data, received in handle)
+     *    dcna = our own CNA  (destination / importer)
+     *
+     *    dmesg errors we've seen and fixed:
+     *      "Exactly one of {ALLOW_MMAP, NUMA_REMOTE}" → use one flag
+     *      "0x0 is not a known scna"                  → fill real CNA
      */
     struct obmm_cmd_import imp;
     memset(&imp, 0, sizeof(imp));
@@ -322,12 +345,16 @@ int main(int argc, char *argv[])
     imp.addr     = wire.uba;
     imp.length   = wire.length;
     imp.tokenid  = wire.tokenid;
-    imp.scna     = wire.scna;
-    imp.dcna     = wire.dcna;
-    imp.numa_id  = -1;      /* any NUMA */
+    imp.scna     = wire.scna;     /* server's CNA (from handle) */
+    imp.dcna     = local_cna;     /* our own CNA */
+    imp.numa_id  = -1;            /* any NUMA */
     imp.base_dist = 0;
     memcpy(imp.seid, wire.seid, 16);
     memcpy(imp.deid, wire.deid, 16);
+
+    printf("    IMPORT params: scna=0x%04x dcna=0x%04x addr=0x%" PRIx64
+           " tokenid=0x%x\n", imp.scna, imp.dcna, (uint64_t)imp.addr,
+           imp.tokenid);
 
     if (ioctl(fd_ctl, OBMM_CMD_IMPORT, &imp) < 0) {
         fprintf(stderr, "[FAIL 3] OBMM_CMD_IMPORT: %s (errno=%d)\n",

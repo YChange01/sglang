@@ -65,6 +65,27 @@ static volatile sig_atomic_t g_stop = 0;
 
 static void on_sigint(int sig) { (void)sig; g_stop = 1; }
 
+/*
+ * Read this node's primary CNA from sysfs. The kernel requires a
+ * valid scna for cross-node IMPORT routing — zero gets rejected with
+ * "0x0 is not a known scna".
+ */
+static uint32_t read_local_cna(void)
+{
+    const char *path = "/sys/devices/ub_bus_controller1/00002/primary_cna";
+    FILE *f = fopen(path, "r");
+    if (!f) {
+        fprintf(stderr, "[warn] cannot read %s: %s\n", path, strerror(errno));
+        return 0;
+    }
+    unsigned int cna = 0;
+    if (fscanf(f, "%x", &cna) != 1) {
+        fprintf(stderr, "[warn] failed to parse CNA from %s\n", path);
+    }
+    fclose(f);
+    return (uint32_t)cna;
+}
+
 static int tcp_listen(uint16_t port)
 {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -188,14 +209,18 @@ int main(int argc, char *argv[])
     if (lsk < 0) { goto fail_mmap; }
     printf("[6] listening on port %u ...\n", port);
 
+    /* Read our local CNA from sysfs — needed for cross-node routing. */
+    uint32_t local_cna = read_local_cna();
+    printf("[*] local CNA = 0x%04x\n", local_cna);
+
     /* Prepare handle once; same bytes sent to every client. */
     struct scheme7_wire_handle wire;
     memset(&wire, 0, sizeof(wire));
     wire.uba      = (uint64_t)exp.uba;
     wire.length   = length;
     wire.tokenid  = exp.tokenid;
-    wire.scna     = 0;         /* try zero first */
-    wire.dcna     = 0;
+    wire.scna     = local_cna;   /* server's CNA — client uses as scna */
+    wire.dcna     = 0;           /* client fills its own */
     wire.pxm_numa = exp.pxm_numa;
     memcpy(wire.seid, exp.seid, 16);
     memcpy(wire.deid, exp.deid, 16);
