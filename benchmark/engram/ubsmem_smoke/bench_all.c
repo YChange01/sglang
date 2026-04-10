@@ -418,15 +418,19 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
 {
     printf("\n======== Mode: %s ========\n", ctx->mode_name);
 
-    /* Verify data */
+    /* Verify data (skip for noncache/hugepage — separate objects, data uninitialized) */
     bench_read_row(ctx, 42, dim);
     float *verify_buf = (ctx->mode == MODE_URMA)
         ? (float *)urma_rw_get_buffer(ctx->urma_ctx)
         : ctx->local_buf;
     float expected = 42.0f * dim * 0.001f;
     float actual = verify_buf[0];
-    printf("  Verify row[42][0]: got=%.4f expect=%.4f %s\n",
-           actual, expected, fabsf(actual - expected) < 0.01f ? "OK" : "MISMATCH");
+    if (ctx->mode == MODE_UBSMEM_NC || ctx->mode == MODE_UBSMEM_HUGE) {
+        printf("  Verify: skipped (separate shmem object, data may differ)\n");
+    } else {
+        printf("  Verify row[42][0]: got=%.4f expect=%.4f %s\n",
+               actual, expected, fabsf(actual - expected) < 0.01f ? "OK" : "MISMATCH");
+    }
 
     bench_single_load(ctx, num_rows, dim, num_iters);
     bench_single_row(ctx, num_rows, dim, num_iters);
@@ -449,33 +453,57 @@ static const float *setup_local(size_t buf_size)
     return buf;
 }
 
+/*
+ * Setup ubs_mem mapping.
+ *
+ * NONCACHE / HUGETLB flags are set at allocate time, not map time.
+ * The server creates the default CACHE object. For noncache/hugepage,
+ * we create a separate shmem object with a suffixed name and the
+ * desired flags via allocate_with_provider.
+ *
+ * For CACHE mode we reuse the server's existing object.
+ */
 static const float *setup_ubsmem(const char *shm_name, size_t buf_size,
                                   const char *provider_host, uint64_t flags,
-                                  void **out_ptr)
+                                  void **out_ptr, char *used_name, size_t name_len)
 {
+    /* Build the actual shmem name: base name + suffix for non-default flags */
+    if (flags == UBSM_FLAG_CACHE) {
+        snprintf(used_name, name_len, "%s", shm_name);
+    } else if (flags == UBSM_FLAG_NONCACHE) {
+        snprintf(used_name, name_len, "%s_nc", shm_name);
+    } else if (flags == UBSM_FLAG_MMAP_HUGETLB_PMD) {
+        snprintf(used_name, name_len, "%s_huge", shm_name);
+    } else {
+        snprintf(used_name, name_len, "%s_0x%lx", shm_name, (unsigned long)flags);
+    }
+
     ubsmem_shmem_info_t info;
-    int ret = ubsmem_shmem_lookup(shm_name, &info);
+    int ret = ubsmem_shmem_lookup(used_name, &info);
     if (ret != 0) {
+        /* Need to create — use allocate_with_provider for cross-node */
         ubs_mem_provider_t prov;
         memset(&prov, 0, sizeof(prov));
         snprintf(prov.host_name, sizeof(prov.host_name), "%s", provider_host);
         prov.socket_id = UINT32_MAX;
         prov.numa_id = UINT32_MAX;
         prov.port_id = UINT32_MAX;
-        ret = ubsmem_shmem_allocate_with_provider(&prov, shm_name, buf_size,
+        ret = ubsmem_shmem_allocate_with_provider(&prov, used_name, buf_size,
                                                    0666, flags);
         if (ret != 0 && ret != UBSM_ERR_ALREADY_EXIST) {
-            fprintf(stderr, "  ubsmem allocate_with_provider failed: %d\n", ret);
+            fprintf(stderr, "  ubsmem allocate_with_provider(%s, flags=0x%lx) failed: %d\n",
+                    used_name, (unsigned long)flags, ret);
         }
     }
 
     void *ptr = NULL;
-    ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ, MAP_SHARED, shm_name, 0, &ptr);
+    ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ, MAP_SHARED, used_name, 0, &ptr);
     if (ret != 0 || !ptr) {
-        fprintf(stderr, "  ubsmem_shmem_map failed: %d\n", ret);
+        fprintf(stderr, "  ubsmem_shmem_map(%s) failed: %d\n", used_name, ret);
         return NULL;
     }
-    printf("  ubs_mem mapped: ptr=%p, flags=0x%lx\n", ptr, (unsigned long)flags);
+    printf("  ubs_mem mapped: name=%s, ptr=%p, flags=0x%lx\n",
+           used_name, ptr, (unsigned long)flags);
     *out_ptr = ptr;
     return (const float *)ptr;
 }
@@ -535,7 +563,8 @@ int main(int argc, char *argv[])
     }
     mode_str = argv[1];
 
-    for (int i = 2; i < argc - 1; i++) {
+    for (int i = 2; i < argc; i++) {
+        if (i + 1 >= argc) break;  /* all flags need a value */
         if (strcmp(argv[i], "--size_mb") == 0)       size_mb = (size_t)atol(argv[++i]);
         else if (strcmp(argv[i], "--name") == 0)      shm_name = argv[++i];
         else if (strcmp(argv[i], "--rows") == 0)      num_rows = atoi(argv[++i]);
@@ -618,8 +647,9 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM (CACHE) ---- */
     if (mode_match(mode_str, "ubsmem") && ubsmem_inited) {
         void *uptr = NULL;
+        char uname[64];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
-                                           UBSM_FLAG_CACHE, &uptr);
+                                           UBSM_FLAG_CACHE, &uptr, uname, sizeof(uname));
         if (udata) {
             bench_ctx_t ctx = { .mode = MODE_UBSMEM,
                                 .mode_name = "UBS-MEM (cache)",
@@ -633,8 +663,9 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM NONCACHE ---- */
     if (mode_match(mode_str, "ubsmem-nc") && ubsmem_inited) {
         void *uptr = NULL;
+        char uname[64];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
-                                           UBSM_FLAG_NONCACHE, &uptr);
+                                           UBSM_FLAG_NONCACHE, &uptr, uname, sizeof(uname));
         if (udata) {
             bench_ctx_t ctx = { .mode = MODE_UBSMEM_NC,
                                 .mode_name = "UBS-MEM (noncache)",
@@ -648,8 +679,9 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM HUGEPAGE ---- */
     if (mode_match(mode_str, "ubsmem-huge") && ubsmem_inited) {
         void *uptr = NULL;
+        char uname[64];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
-                                           UBSM_FLAG_MMAP_HUGETLB_PMD, &uptr);
+                                           UBSM_FLAG_MMAP_HUGETLB_PMD, &uptr, uname, sizeof(uname));
         if (udata) {
             bench_ctx_t ctx = { .mode = MODE_UBSMEM_HUGE,
                                 .mode_name = "UBS-MEM (2MB hugepage)",
