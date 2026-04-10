@@ -44,7 +44,6 @@
 /* URMA RW library */
 #include "../lib/urma_rw.h"
 
-#define NUM_TABLES 12
 #define DEFAULT_TCP_PORT  13900
 #define DEFAULT_URMA_PORT 13857
 
@@ -177,52 +176,6 @@ static int bench_read_row(bench_ctx_t *ctx, int row, int dim)
     return -1;
 }
 
-/* Read N rows. For URMA uses batch post+poll. */
-static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int dim)
-{
-    int row_bytes = dim * (int)sizeof(float);
-
-    switch (ctx->mode) {
-    case MODE_LOCAL:
-    case MODE_UBSMEM:
-    case MODE_UBSMEM_NC:
-    case MODE_UBSMEM_HUGE:
-        for (int i = 0; i < count; i++) {
-            memcpy(ctx->local_buf + (size_t)i * dim,
-                   ctx->data_ptr + (size_t)rows[i] * dim, row_bytes);
-        }
-        return 0;
-
-    case MODE_TCP: {
-        for (int i = 0; i < count; i++) {
-            tcp_req_t req = { .offset = (uint64_t)rows[i] * row_bytes,
-                              .length = row_bytes };
-            if (tcp_send_all(ctx->tcp_fd, &req, sizeof(req)) != 0) return -1;
-        }
-        for (int i = 0; i < count; i++) {
-            if (tcp_recv_all(ctx->tcp_fd, ctx->local_buf + (size_t)i * dim,
-                             row_bytes) != 0) return -1;
-        }
-        return 0;
-    }
-
-    case MODE_URMA: {
-        if (count > URMA_RW_MAX_BATCH) return -1;
-        /* Use static buffers to avoid malloc in hot path */
-        static uint64_t s_locals[URMA_RW_MAX_BATCH];
-        static uint64_t s_remotes[URMA_RW_MAX_BATCH];
-        static uint32_t s_lens[URMA_RW_MAX_BATCH];
-        for (int i = 0; i < count; i++) {
-            s_locals[i]  = (uint64_t)i * row_bytes;
-            s_remotes[i] = (uint64_t)rows[i] * row_bytes;
-            s_lens[i]    = row_bytes;
-        }
-        return urma_rw_read_batch(ctx->urma_ctx, s_locals, s_remotes, s_lens, count);
-    }
-    }
-    return -1;
-}
-
 /* ------------------------------------------------------------------ */
 /*  Benchmarks                                                        */
 /* ------------------------------------------------------------------ */
@@ -294,80 +247,6 @@ static void bench_single_row(bench_ctx_t *ctx, int num_rows, int dim,
     printf("    Throughput: %.1f MB/s\n", (double)row_bytes / avg);
 }
 
-static void bench_batch(bench_ctx_t *ctx, int num_rows, int dim, int num_iters)
-{
-    int row_bytes = dim * (int)sizeof(float);
-    int batches[] = {32, 64, 128, 256};
-
-    printf("\n  [Batch read]\n");
-    printf("    %-8s %-10s %-12s %-12s %-12s\n",
-           "Batch", "Data", "Total us", "Per-row us", "Throughput");
-    printf("    -----------------------------------------------------------\n");
-
-    for (int b = 0; b < 4; b++) {
-        int batch = batches[b];
-        int *rows = (int *)malloc(batch * sizeof(int));
-        if (!rows) continue;
-
-        struct timespec t0, t1;
-        double total_us = 0;
-
-        for (int iter = 0; iter < num_iters; iter++) {
-            for (int i = 0; i < batch; i++) rows[i] = rand() % num_rows;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            bench_read_batch(ctx, rows, batch, dim);
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            total_us += diff_us(&t0, &t1);
-        }
-
-        double avg = total_us / num_iters;
-        double per_row = avg / batch;
-        double data_kb = (double)batch * row_bytes / 1024.0;
-        double throughput = (data_kb / 1024.0) / (avg / 1e6);
-        printf("    %-8d %-8.1fKB %-10.2f %-10.3f %.1f MB/s\n",
-               batch, data_kb, avg, per_row, throughput);
-        free(rows);
-    }
-}
-
-static void bench_engram_prefetch(bench_ctx_t *ctx, int num_rows, int dim,
-                                  int num_iters)
-{
-    int row_bytes = dim * (int)sizeof(float);
-    int token_counts[] = {32, 64, 128, 256};
-
-    printf("\n  [Engram prefetch] %d tables x N tokens\n", NUM_TABLES);
-    printf("    %-8s %-8s %-10s %-12s %-12s\n",
-           "Tokens", "Reads", "Data", "Avg ms", "Throughput");
-    printf("    -----------------------------------------------------------\n");
-
-    for (int b = 0; b < 4; b++) {
-        int tokens = token_counts[b];
-        int total_reads = NUM_TABLES * tokens;
-
-        int *rows = (int *)malloc(total_reads * sizeof(int));
-        if (!rows) continue;
-
-        struct timespec t0, t1;
-        double total_us = 0;
-
-        for (int iter = 0; iter < num_iters; iter++) {
-            for (int i = 0; i < total_reads; i++) rows[i] = rand() % num_rows;
-            clock_gettime(CLOCK_MONOTONIC, &t0);
-            bench_read_batch(ctx, rows, total_reads, dim);
-            clock_gettime(CLOCK_MONOTONIC, &t1);
-            total_us += diff_us(&t0, &t1);
-        }
-
-        double avg_ms = total_us / num_iters / 1000.0;
-        double data_mb = (double)total_reads * row_bytes / (1024.0 * 1024.0);
-        double throughput = data_mb / (avg_ms / 1e3);
-        printf("    %-8d %-8d %-8.1fMB %-10.4f %.1f MB/s\n",
-               tokens, total_reads, data_mb, avg_ms, throughput);
-        free(rows);
-    }
-}
-
 static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
 {
     if (ctx->mode == MODE_TCP || ctx->mode == MODE_URMA) {
@@ -413,7 +292,7 @@ static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
  * Engram-27B parameters:
  *   vocab_size = 2,262,400; emb_dim = 1,280
  *   Per token: 8 hash-mapped segments, each 320 bytes, sparse addresses
- *   Batch sizes: 1, 4, 16, 64, 256, 1024
+ *   Batch sizes: 1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096
  */
 #define PAPER_SEGS_PER_TOKEN  8
 #define PAPER_SEG_BYTES       320
@@ -446,15 +325,23 @@ static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
         break;
 
     case MODE_URMA: {
+        /* Split into chunks of URMA_RW_MAX_BATCH for large batches */
         static uint64_t s_locals[URMA_RW_MAX_BATCH];
         static uint64_t s_remotes[URMA_RW_MAX_BATCH];
         static uint32_t s_lens[URMA_RW_MAX_BATCH];
-        for (int i = 0; i < count; i++) {
-            s_locals[i]  = (uint64_t)i * PAPER_SEG_BYTES;
-            s_remotes[i] = offsets[i];
-            s_lens[i]    = PAPER_SEG_BYTES;
+        int remaining = count;
+        int done = 0;
+        while (remaining > 0) {
+            int chunk = remaining > URMA_RW_MAX_BATCH ? URMA_RW_MAX_BATCH : remaining;
+            for (int i = 0; i < chunk; i++) {
+                s_locals[i]  = (uint64_t)(done + i) * PAPER_SEG_BYTES;
+                s_remotes[i] = offsets[done + i];
+                s_lens[i]    = PAPER_SEG_BYTES;
+            }
+            urma_rw_read_batch(ctx->urma_ctx, s_locals, s_remotes, s_lens, chunk);
+            done += chunk;
+            remaining -= chunk;
         }
-        urma_rw_read_batch(ctx->urma_ctx, s_locals, s_remotes, s_lens, count);
         break;
     }
     }
@@ -462,8 +349,8 @@ static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
 
 static void bench_paper_27b(bench_ctx_t *ctx, size_t data_size, int num_iters)
 {
-    int batch_sizes[] = {1, 4, 16, 64, 256, 1024};
-    int nbatches = 6;
+    int batch_sizes[] = {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096};
+    int nbatches = 13;
 
     printf("\n  [Paper: Engram-27B] 8 segs x 320B per token, sparse\n");
     printf("    %-8s %-8s %-10s %-12s %-12s\n",
@@ -476,11 +363,6 @@ static void bench_paper_27b(bench_ctx_t *ctx, size_t data_size, int num_iters)
     for (int b = 0; b < nbatches; b++) {
         int batch = batch_sizes[b];
         int total_segs = batch * PAPER_SEGS_PER_TOKEN;
-
-        if (total_segs > URMA_RW_MAX_BATCH && ctx->mode == MODE_URMA) {
-            printf("    %-8d (skipped: %d > URMA_RW_MAX_BATCH)\n", batch, total_segs);
-            continue;
-        }
 
         uint64_t *offsets = (uint64_t *)malloc(total_segs * sizeof(uint64_t));
         if (!offsets) continue;
@@ -539,8 +421,6 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
 
     bench_single_load(ctx, num_rows, dim, num_iters);
     bench_single_row(ctx, num_rows, dim, num_iters);
-    bench_batch(ctx, num_rows, dim, num_iters);
-    bench_engram_prefetch(ctx, num_rows, dim, num_iters);
     bench_paper_27b(ctx, (size_t)num_rows * dim * sizeof(float), num_iters);
     bench_cold_hot(ctx, num_rows, dim);
 }
@@ -682,7 +562,8 @@ int main(int argc, char *argv[])
 
     size_t buf_size = size_mb * 1024 * 1024;
     int row_bytes = dim * (int)sizeof(float);
-    size_t local_buf_size = (size_t)NUM_TABLES * 256 * row_bytes;
+    /* Max paper batch: 4096 tokens × 8 segs × 320B = 10 MB */
+    size_t local_buf_size = (size_t)4096 * PAPER_SEGS_PER_TOKEN * PAPER_SEG_BYTES;
     if (local_buf_size < buf_size) local_buf_size = buf_size;
 
     printf("=== Unified Cross-Node Benchmark ===\n");
