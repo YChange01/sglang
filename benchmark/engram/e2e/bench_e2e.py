@@ -201,7 +201,7 @@ def run_table2(args: argparse.Namespace) -> None:
 
     backends_to_test = []
     if args.all:
-        backends_to_test = ["local", "tcp", "urma", "ubsmem"]
+        backends_to_test = ["local", "urma", "ubsmem"]
     else:
         backends_to_test = [args.backend]
 
