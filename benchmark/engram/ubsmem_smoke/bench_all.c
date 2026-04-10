@@ -208,21 +208,16 @@ static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int di
 
     case MODE_URMA: {
         if (count > URMA_RW_MAX_BATCH) return -1;
-        uint64_t *locals  = (uint64_t *)malloc(count * sizeof(uint64_t));
-        uint64_t *remotes = (uint64_t *)malloc(count * sizeof(uint64_t));
-        uint32_t *lens    = (uint32_t *)malloc(count * sizeof(uint32_t));
-        if (!locals || !remotes || !lens) {
-            free(locals); free(remotes); free(lens);
-            return -1;
-        }
+        /* Use static buffers to avoid malloc in hot path */
+        static uint64_t s_locals[URMA_RW_MAX_BATCH];
+        static uint64_t s_remotes[URMA_RW_MAX_BATCH];
+        static uint32_t s_lens[URMA_RW_MAX_BATCH];
         for (int i = 0; i < count; i++) {
-            locals[i]  = (uint64_t)i * row_bytes;
-            remotes[i] = (uint64_t)rows[i] * row_bytes;
-            lens[i]    = row_bytes;
+            s_locals[i]  = (uint64_t)i * row_bytes;
+            s_remotes[i] = (uint64_t)rows[i] * row_bytes;
+            s_lens[i]    = row_bytes;
         }
-        int ret = urma_rw_read_batch(ctx->urma_ctx, locals, remotes, lens, count);
-        free(locals); free(remotes); free(lens);
-        return ret;
+        return urma_rw_read_batch(ctx->urma_ctx, s_locals, s_remotes, s_lens, count);
     }
     }
     return -1;
@@ -647,7 +642,7 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM (CACHE) ---- */
     if (mode_match(mode_str, "ubsmem") && ubsmem_inited) {
         void *uptr = NULL;
-        char uname[64];
+        char uname[MAX_SHM_NAME_LENGTH + 1];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_CACHE, &uptr, uname, sizeof(uname));
         if (udata) {
@@ -663,7 +658,7 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM NONCACHE ---- */
     if (mode_match(mode_str, "ubsmem-nc") && ubsmem_inited) {
         void *uptr = NULL;
-        char uname[64];
+        char uname[MAX_SHM_NAME_LENGTH + 1];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_NONCACHE, &uptr, uname, sizeof(uname));
         if (udata) {
@@ -679,7 +674,7 @@ int main(int argc, char *argv[])
     /* ---- UBSMEM HUGEPAGE ---- */
     if (mode_match(mode_str, "ubsmem-huge") && ubsmem_inited) {
         void *uptr = NULL;
-        char uname[64];
+        char uname[MAX_SHM_NAME_LENGTH + 1];
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_MMAP_HUGETLB_PMD, &uptr, uname, sizeof(uname));
         if (udata) {
