@@ -1,4 +1,9 @@
-# UBS-MEM Smoke Test: load/store via ubs_mem SDK
+# UBS-MEM Unified Benchmark
+#
+# Targets:
+#   server    — data provider (ubs_mem shmem + TCP listener)
+#   client    — original single-mode ubs_mem client
+#   bench_all — unified multi-mode benchmark (local/tcp/ubsmem/ubsmem-nc/ubsmem-huge)
 #
 # Prerequisites:
 #   - ubs_mem SDK installed at /usr/local/ubs_mem/
@@ -13,7 +18,7 @@ LDFLAGS = -L/usr/local/ubs_mem/lib -lubsm_sdk -lpthread -lm \
 
 .PHONY: all clean
 
-all: server client
+all: server client bench_all
 
 server: server.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
@@ -23,5 +28,9 @@ client: client.c
 	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
 	@echo "Built $@"
 
+bench_all: bench_all.c
+	$(CC) $(CFLAGS) $(INCLUDES) -o $@ $< $(LDFLAGS)
+	@echo "Built $@"
+
 clean:
-	rm -f server client *.o
+	rm -f server client bench_all *.o
