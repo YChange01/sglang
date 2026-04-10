@@ -48,7 +48,7 @@
 
 /*
  * Wire format shared with client.c — keep the two definitions in sync.
- * 72 bytes, naturally aligned, same-endian only (aarch64 ↔ aarch64).
+ * 80 bytes, packed, same-endian only (aarch64 ↔ aarch64).
  */
 struct scheme7_wire_handle {
     uint64_t uba;          /* remote UB fabric address (from EXPORT) */
@@ -244,8 +244,19 @@ int main(int argc, char *argv[])
     memcpy(wire.seid, exp.seid, 16);
     memcpy(wire.deid, exp.deid, 16);
 
-    signal(SIGINT, on_sigint);
-    signal(SIGTERM, on_sigint);
+    /* Use sigaction WITHOUT SA_RESTART so that accept() returns EINTR
+     * on signal delivery. glibc's signal() sets SA_RESTART by default,
+     * which causes accept() to silently resume after SIGINT — the user
+     * already hit this: "Ctrl+C 停不了". */
+    {
+        struct sigaction sa_act;
+        memset(&sa_act, 0, sizeof(sa_act));
+        sa_act.sa_handler = on_sigint;
+        sigemptyset(&sa_act.sa_mask);
+        sa_act.sa_flags = 0;  /* NO SA_RESTART */
+        sigaction(SIGINT, &sa_act, NULL);
+        sigaction(SIGTERM, &sa_act, NULL);
+    }
 
     printf("\nServer ready. Press Ctrl+C to stop.\n\n");
 

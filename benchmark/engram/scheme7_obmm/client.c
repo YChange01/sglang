@@ -369,7 +369,6 @@ int main(int argc, char *argv[])
      *     dcna = our own CNA  (destination / importer) */
     struct obmm_cmd_import imp;
     memset(&imp, 0, sizeof(imp));
-    imp.flags     = OBMM_IMPORT_FLAG_NUMA_REMOTE | OBMM_IMPORT_FLAG_PREIMPORT;
     imp.addr      = wire.pa;       /* PA, not uba! consultant said "import的是pa" */
     imp.length    = wire.length;
     imp.tokenid   = wire.tokenid;
@@ -380,21 +379,41 @@ int main(int argc, char *argv[])
     memcpy(imp.seid, wire.seid, 16);
     memcpy(imp.deid, wire.deid, 16);
 
-    printf("[3b] IMPORT params: scna=0x%04x dcna=0x%04x addr=0x%" PRIx64
-           " tokenid=0x%x flags=0x%" PRIx64 "\n",
-           imp.scna, imp.dcna, (uint64_t)imp.addr,
-           imp.tokenid, (uint64_t)imp.flags);
+    /* Try NUMA_REMOTE + PREIMPORT first (fast path using the pre-
+     * declaration). If kernel rejects the combo, fall back to just
+     * NUMA_REMOTE. The kernel error message for the ALLOW_MMAP+
+     * NUMA_REMOTE case was about those two being mutually exclusive;
+     * PREIMPORT (0x2) is orthogonal, but we hedge in case. */
+    uint64_t flag_attempts[] = {
+        OBMM_IMPORT_FLAG_NUMA_REMOTE | OBMM_IMPORT_FLAG_PREIMPORT,
+        OBMM_IMPORT_FLAG_NUMA_REMOTE,
+    };
+    const char *flag_names[] = {
+        "NUMA_REMOTE|PREIMPORT (0x6)",
+        "NUMA_REMOTE (0x4)",
+    };
+    int import_ok = 0;
+    for (int fi = 0; fi < 2; fi++) {
+        imp.flags = flag_attempts[fi];
+        printf("[3b] IMPORT try flags=%s addr=0x%" PRIx64 " tokenid=0x%x\n",
+               flag_names[fi], (uint64_t)imp.addr, imp.tokenid);
 
-    if (ioctl(fd_ctl, OBMM_CMD_IMPORT, &imp) < 0) {
-        fprintf(stderr, "[FAIL 3b] OBMM_CMD_IMPORT: %s (errno=%d)\n",
-                strerror(errno), errno);
+        if (ioctl(fd_ctl, OBMM_CMD_IMPORT, &imp) == 0) {
+            printf("     IMPORT ok: local mem_id=%" PRIu64 "\n",
+                   (uint64_t)imp.mem_id);
+            import_ok = 1;
+            break;
+        }
+        fprintf(stderr, "     IMPORT %s: %s (errno=%d)\n",
+                flag_names[fi], strerror(errno), errno);
+    }
+    if (!import_ok) {
+        fprintf(stderr, "[FAIL 3b] all IMPORT flag variants failed\n");
         fprintf(stderr, "          dmesg | grep -i obmm | tail -5\n");
-        /* cleanup preimport */
         (void)ioctl(fd_ctl, OBMM_CMD_UNDECLARE_PREIMPORT, &pre);
         close(fd_ctl);
         return 1;
     }
-    printf("[3b] IMPORT ok: local mem_id=%" PRIu64 "\n", (uint64_t)imp.mem_id);
 
     /* 4. open /dev/obmm_shmdev<local_mem_id> */
     char path[64];
