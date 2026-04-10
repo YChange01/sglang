@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <limits.h>
 #include <math.h>
 #include <time.h>
 #include <sys/mman.h>
