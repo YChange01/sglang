@@ -52,6 +52,7 @@
  */
 struct scheme7_wire_handle {
     uint64_t uba;          /* remote UB fabric address (from EXPORT) */
+    uint64_t pa;           /* physical address (from ADDR_QUERY) */
     uint64_t length;       /* bytes */
     uint32_t tokenid;      /* access credential (from EXPORT) */
     uint32_t scna;         /* source CNA (exporter's) */
@@ -167,6 +168,23 @@ int main(int argc, char *argv[])
     printf("[2] EXPORT ok: mem_id=%" PRIu64 " tokenid=0x%x uba=0x%" PRIx64 "\n",
            (uint64_t)exp.mem_id, exp.tokenid, (uint64_t)exp.uba);
 
+    /* 2b. ADDR_QUERY: translate (mem_id, offset=0) → PA.
+     *     The consultant told us: "export出来的是 VA, import 的是 PA,
+     *     要转一下". This is the "转一下" — convert UBA to PA so the
+     *     client can use PA for DECLARE_PREIMPORT + IMPORT. */
+    struct obmm_cmd_addr_query aq;
+    memset(&aq, 0, sizeof(aq));
+    aq.key_type = OBMM_QUERY_BY_ID_OFFSET;
+    aq.mem_id   = exp.mem_id;
+    aq.offset   = 0;
+    if (ioctl(fd_ctl, OBMM_CMD_ADDR_QUERY, &aq) < 0) {
+        fprintf(stderr, "[warn] ADDR_QUERY failed: %s (errno=%d) — pa will be 0\n",
+                strerror(errno), errno);
+        aq.pa = 0;
+    } else {
+        printf("[2b] ADDR_QUERY ok: pa=0x%" PRIx64 "\n", (uint64_t)aq.pa);
+    }
+
     /* 3. open /dev/obmm_shmdev<mem_id> */
     char path[64];
     snprintf(path, sizeof(path), "/dev/obmm_shmdev%" PRIu64, (uint64_t)exp.mem_id);
@@ -217,6 +235,7 @@ int main(int argc, char *argv[])
     struct scheme7_wire_handle wire;
     memset(&wire, 0, sizeof(wire));
     wire.uba      = (uint64_t)exp.uba;
+    wire.pa       = (uint64_t)aq.pa;
     wire.length   = length;
     wire.tokenid  = exp.tokenid;
     wire.scna     = local_cna;   /* server's CNA — client uses as scna */

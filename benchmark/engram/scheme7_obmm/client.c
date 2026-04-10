@@ -59,6 +59,7 @@
 
 struct scheme7_wire_handle {
     uint64_t uba;
+    uint64_t pa;           /* physical address from ADDR_QUERY */
     uint64_t length;
     uint32_t tokenid;
     uint32_t scna;
@@ -308,9 +309,11 @@ int main(int argc, char *argv[])
     close(cs);
     printf("[1] handle recv ok\n");
     printf("    uba     = 0x%" PRIx64 "\n", wire.uba);
+    printf("    pa      = 0x%" PRIx64 "\n", wire.pa);
     printf("    length  = %" PRIu64 " (%.1f MB)\n",
            wire.length, wire.length / (1024.0 * 1024.0));
     printf("    tokenid = 0x%x\n", wire.tokenid);
+    printf("    scna    = 0x%04x\n", wire.scna);
 
     /* Sanity check that the remote table is at least as big as we
      * expect based on num_rows × dim. */
@@ -329,41 +332,69 @@ int main(int argc, char *argv[])
     uint32_t local_cna = read_local_cna();
     printf("[2] /dev/obmm fd_ctl=%d, local CNA=0x%04x\n", fd_ctl, local_cna);
 
-    /* 3. IMPORT. Kernel requires EXACTLY ONE of {ALLOW_MMAP, NUMA_REMOTE}.
-     *    For cross-node: use NUMA_REMOTE alone.
+    /* 3a. DECLARE_PREIMPORT — pre-register the remote CNA with the
+     *     local kernel so it becomes a "known scna". Without this step,
+     *     IMPORT fails: "0x40a is not a known scna, lookup ret=-EPERM".
      *
-     *    scna = server's CNA (source of data, received in handle)
-     *    dcna = our own CNA  (destination / importer)
+     *     This is what UBSE does under the hood in the ubs-mem flow —
+     *     we do it ourselves since we bypass UBSE entirely. */
+    struct obmm_cmd_preimport pre;
+    memset(&pre, 0, sizeof(pre));
+    pre.pa       = wire.pa;       /* physical address from ADDR_QUERY */
+    pre.length   = wire.length;
+    pre.flags    = 0;
+    pre.scna     = wire.scna;     /* server's CNA (must be "known" after this) */
+    pre.dcna     = local_cna;     /* our own CNA */
+    pre.numa_id  = -1;            /* any NUMA */
+    pre.base_dist = 0;
+    memcpy(pre.seid, wire.seid, 16);
+    memcpy(pre.deid, wire.deid, 16);
+
+    printf("[3a] DECLARE_PREIMPORT: scna=0x%04x dcna=0x%04x pa=0x%" PRIx64 "\n",
+           pre.scna, pre.dcna, (uint64_t)pre.pa);
+
+    if (ioctl(fd_ctl, OBMM_CMD_DECLARE_PREIMPORT, &pre) < 0) {
+        fprintf(stderr, "[FAIL 3a] DECLARE_PREIMPORT: %s (errno=%d)\n",
+                strerror(errno), errno);
+        fprintf(stderr, "          dmesg | grep -i obmm | tail -5\n");
+        close(fd_ctl);
+        return 1;
+    }
+    printf("    PREIMPORT ok\n");
+
+    /* 3b. IMPORT. Use NUMA_REMOTE alone (not ALLOW_MMAP — mutually
+     *     exclusive per kernel check). Use PA as addr (not uba).
      *
-     *    dmesg errors we've seen and fixed:
-     *      "Exactly one of {ALLOW_MMAP, NUMA_REMOTE}" → use one flag
-     *      "0x0 is not a known scna"                  → fill real CNA
-     */
+     *     scna = server's CNA (source of data, from handle)
+     *     dcna = our own CNA  (destination / importer) */
     struct obmm_cmd_import imp;
     memset(&imp, 0, sizeof(imp));
-    imp.flags    = OBMM_IMPORT_FLAG_NUMA_REMOTE;
-    imp.addr     = wire.uba;
-    imp.length   = wire.length;
-    imp.tokenid  = wire.tokenid;
-    imp.scna     = wire.scna;     /* server's CNA (from handle) */
-    imp.dcna     = local_cna;     /* our own CNA */
-    imp.numa_id  = -1;            /* any NUMA */
+    imp.flags     = OBMM_IMPORT_FLAG_NUMA_REMOTE | OBMM_IMPORT_FLAG_PREIMPORT;
+    imp.addr      = wire.pa;       /* PA, not uba! consultant said "import的是pa" */
+    imp.length    = wire.length;
+    imp.tokenid   = wire.tokenid;
+    imp.scna      = wire.scna;     /* server's CNA (now "known" from preimport) */
+    imp.dcna      = local_cna;     /* our own CNA */
+    imp.numa_id   = -1;            /* any NUMA */
     imp.base_dist = 0;
     memcpy(imp.seid, wire.seid, 16);
     memcpy(imp.deid, wire.deid, 16);
 
-    printf("    IMPORT params: scna=0x%04x dcna=0x%04x addr=0x%" PRIx64
-           " tokenid=0x%x\n", imp.scna, imp.dcna, (uint64_t)imp.addr,
-           imp.tokenid);
+    printf("[3b] IMPORT params: scna=0x%04x dcna=0x%04x addr=0x%" PRIx64
+           " tokenid=0x%x flags=0x%" PRIx64 "\n",
+           imp.scna, imp.dcna, (uint64_t)imp.addr,
+           imp.tokenid, (uint64_t)imp.flags);
 
     if (ioctl(fd_ctl, OBMM_CMD_IMPORT, &imp) < 0) {
-        fprintf(stderr, "[FAIL 3] OBMM_CMD_IMPORT: %s (errno=%d)\n",
+        fprintf(stderr, "[FAIL 3b] OBMM_CMD_IMPORT: %s (errno=%d)\n",
                 strerror(errno), errno);
-        fprintf(stderr, "         check dmesg for obmm kernel message\n");
+        fprintf(stderr, "          dmesg | grep -i obmm | tail -5\n");
+        /* cleanup preimport */
+        (void)ioctl(fd_ctl, OBMM_CMD_UNDECLARE_PREIMPORT, &pre);
         close(fd_ctl);
         return 1;
     }
-    printf("[3] IMPORT ok: local mem_id=%" PRIu64 "\n", (uint64_t)imp.mem_id);
+    printf("[3b] IMPORT ok: local mem_id=%" PRIu64 "\n", (uint64_t)imp.mem_id);
 
     /* 4. open /dev/obmm_shmdev<local_mem_id> */
     char path[64];
@@ -417,6 +448,8 @@ int main(int argc, char *argv[])
             printf("\n[cleanup] UNIMPORT ok\n");
         }
     }
+    /* undeclare preimport */
+    (void)ioctl(fd_ctl, OBMM_CMD_UNDECLARE_PREIMPORT, &pre);
     close(fd_ctl);
     printf("Done.\n");
     return 0;
@@ -431,6 +464,7 @@ fail_import:
         un.mem_id = imp.mem_id;
         (void)ioctl(fd_ctl, OBMM_CMD_UNIMPORT, &un);
     }
+    (void)ioctl(fd_ctl, OBMM_CMD_UNDECLARE_PREIMPORT, &pre);
     close(fd_ctl);
     return 1;
 }
