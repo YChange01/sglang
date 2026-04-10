@@ -280,7 +280,7 @@ int main(int argc, char *argv[])
         return 1;
     }
     ubsmem_set_logger_level(1);
-    printf("[1/3] ubsmem_initialize OK\n");
+    printf("[1/4] ubsmem_initialize OK\n");
 
     /* Step 2: Lookup shmem info (may fail on remote node) */
     ubsmem_shmem_info_t shm_info;
@@ -304,12 +304,13 @@ int main(int argc, char *argv[])
                phost, shm_name, buf_size);
         ret = ubsmem_shmem_allocate_with_provider(&provider, shm_name, buf_size,
                                                    0666, UBSM_FLAG_CACHE);
-        if (ret != 0) {
+        if (ret != 0 && ret != UBSM_ERR_ALREADY_EXIST) {
             fprintf(stderr, "[2/4] allocate_with_provider failed: %d\n", ret);
             /* Last resort: try map anyway */
             printf("  Trying direct map without lookup...\n");
         } else {
-            printf("[2/4] allocate_with_provider OK\n");
+            printf("[2/4] allocate_with_provider %s\n",
+                   ret == UBSM_ERR_ALREADY_EXIST ? "OK (already exists)" : "OK");
         }
     } else {
         printf("[2/4] shmem lookup OK: name=%s, size=%zu, mem_num=%u\n",
