@@ -199,12 +199,12 @@ int main(int argc, char *argv[])
         return 1;
     }
     ubsmem_set_logger_level(2);
-    printf("[1/4] ubs_mem OK\n");
+    printf("[1/5] ubs_mem OK\n");
 
     /* Step 2: Cluster info */
     ubsmem_cluster_info_t cinfo;
     if (ubsmem_lookup_cluster_statistic(&cinfo) == 0) {
-        printf("[2/4] Cluster: %d hosts\n", cinfo.host_num);
+        printf("[2/5] Cluster: %d hosts\n", cinfo.host_num);
         for (int h = 0; h < cinfo.host_num; h++)
             printf("  host[%d]: %s\n", h, cinfo.host[h].host_name);
     }
@@ -233,7 +233,7 @@ int main(int argc, char *argv[])
     printf("[3/5] shmem CACHE OK: %s, ptr=%p\n", shm_name, ptr);
 
     /* Step 4: Allocate + map shmem (NONCACHE) */
-    char shm_name_nc[64];
+    char shm_name_nc[MAX_SHM_NAME_LENGTH + 1];
     snprintf(shm_name_nc, sizeof(shm_name_nc), "%s_nc", shm_name);
     ubsmem_shmem_deallocate(shm_name_nc);
 
@@ -279,7 +279,9 @@ int main(int argc, char *argv[])
 
     signal(SIGINT, sigint_handler);
     printf("\nServer ready. Ctrl+C to stop.\n");
-    printf("  shmem: %s (%zu MB)\n", shm_name, size_mb);
+    printf("  shmem: %s (%zu MB, cache)\n", shm_name, size_mb);
+    if (ptr_nc)
+        printf("  shmem: %s (%zu MB, noncache)\n", shm_name_nc, size_mb);
     printf("  TCP:   :%u\n", tcp_port);
     printf("  URMA:  :%u\n\n", urma_port);
 
