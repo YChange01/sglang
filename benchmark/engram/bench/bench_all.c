@@ -530,8 +530,8 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
         : ctx->local_buf;
     float expected = 42.0f * dim * 0.001f;
     float actual = verify_buf[0];
-    if (ctx->mode == MODE_UBSMEM_NC || ctx->mode == MODE_UBSMEM_HUGE) {
-        printf("  Verify: skipped (separate shmem object, data may differ)\n");
+    if (ctx->mode == MODE_UBSMEM_HUGE) {
+        printf("  Verify: skipped (hugepage shmem not created by server)\n");
     } else {
         printf("  Verify row[42][0]: got=%.4f expect=%.4f %s\n",
                actual, expected, fabsf(actual - expected) < 0.01f ? "OK" : "MISMATCH");
@@ -563,11 +563,9 @@ static const float *setup_local(size_t buf_size)
  * Setup ubs_mem mapping.
  *
  * NONCACHE / HUGETLB flags are set at allocate time, not map time.
- * The server creates the default CACHE object. For noncache/hugepage,
- * we create a separate shmem object with a suffixed name and the
- * desired flags via allocate_with_provider.
- *
- * For CACHE mode we reuse the server's existing object.
+ * The server creates both CACHE ("engram_test") and NONCACHE
+ * ("engram_test_nc") objects. Client maps the appropriate one.
+ * If lookup fails (cross-node), falls back to allocate_with_provider.
  */
 static const float *setup_ubsmem(const char *shm_name, size_t buf_size,
                                   const char *provider_host, uint64_t flags,

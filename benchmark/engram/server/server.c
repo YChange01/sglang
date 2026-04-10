@@ -209,14 +209,14 @@ int main(int argc, char *argv[])
             printf("  host[%d]: %s\n", h, cinfo.host[h].host_name);
     }
 
-    /* Step 3: Allocate + map shmem */
+    /* Step 3: Allocate + map shmem (CACHE) */
     const char *region_name = "default";
     ubsmem_shmem_deallocate(shm_name);
 
     int ret = ubsmem_shmem_allocate(region_name, shm_name, buf_size,
                                     0666, UBSM_FLAG_CACHE);
     if (ret != 0) {
-        fprintf(stderr, "[3/4] shmem_allocate failed: %d\n", ret);
+        fprintf(stderr, "[3/5] shmem_allocate(%s) failed: %d\n", shm_name, ret);
         ubsmem_finalize();
         return 1;
     }
@@ -225,19 +225,47 @@ int main(int argc, char *argv[])
     ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ | PROT_WRITE,
                            MAP_SHARED, shm_name, 0, &ptr);
     if (ret != 0 || !ptr) {
-        fprintf(stderr, "[3/4] shmem_map failed: %d\n", ret);
+        fprintf(stderr, "[3/5] shmem_map(%s) failed: %d\n", shm_name, ret);
         ubsmem_shmem_deallocate(shm_name);
         ubsmem_finalize();
         return 1;
     }
-    printf("[3/4] shmem OK: %s, ptr=%p\n", shm_name, ptr);
+    printf("[3/5] shmem CACHE OK: %s, ptr=%p\n", shm_name, ptr);
 
-    /* Step 4: Fill data */
+    /* Step 4: Allocate + map shmem (NONCACHE) */
+    char shm_name_nc[64];
+    snprintf(shm_name_nc, sizeof(shm_name_nc), "%s_nc", shm_name);
+    ubsmem_shmem_deallocate(shm_name_nc);
+
+    void *ptr_nc = NULL;
+    ret = ubsmem_shmem_allocate(region_name, shm_name_nc, buf_size,
+                                0666, UBSM_FLAG_NONCACHE);
+    if (ret != 0) {
+        printf("[4/5] shmem_allocate(%s, NONCACHE) failed: %d (non-fatal)\n",
+               shm_name_nc, ret);
+    } else {
+        ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, shm_name_nc, 0, &ptr_nc);
+        if (ret != 0 || !ptr_nc) {
+            printf("[4/5] shmem_map(%s) failed: %d (non-fatal)\n", shm_name_nc, ret);
+            ptr_nc = NULL;
+        } else {
+            printf("[4/5] shmem NONCACHE OK: %s, ptr=%p\n", shm_name_nc, ptr_nc);
+        }
+    }
+
+    /* Step 5: Fill data (both CACHE and NONCACHE) */
     float *data = (float *)ptr;
     size_t num_floats = buf_size / sizeof(float);
     for (size_t i = 0; i < num_floats; i++)
         data[i] = (float)i * 0.001f;
-    printf("[4/4] Data filled: %zu floats\n", num_floats);
+    if (ptr_nc) {
+        float *data_nc = (float *)ptr_nc;
+        for (size_t i = 0; i < num_floats; i++)
+            data_nc[i] = (float)i * 0.001f;
+    }
+    printf("[5/5] Data filled: %zu floats%s\n", num_floats,
+           ptr_nc ? " (cache + noncache)" : " (cache only)");
 
     /* Start TCP thread */
     tcp_args_t ta = { (const char *)data, buf_size, tcp_port };
@@ -265,6 +293,10 @@ int main(int argc, char *argv[])
 
     ubsmem_shmem_unmap(ptr, buf_size);
     ubsmem_shmem_deallocate(shm_name);
+    if (ptr_nc) {
+        ubsmem_shmem_unmap(ptr_nc, buf_size);
+        ubsmem_shmem_deallocate(shm_name_nc);
+    }
     ubsmem_finalize();
     printf("Done.\n");
     return 0;
