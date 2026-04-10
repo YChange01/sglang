@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
+#include <math.h>
 #include <time.h>
 #include <sys/mman.h>
 #include <ubs_mem.h>
