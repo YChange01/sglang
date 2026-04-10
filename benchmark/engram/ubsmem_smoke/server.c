@@ -145,7 +145,7 @@ int main(int argc, char *argv[])
     printf("[4/6] ubsmem_shmem_allocate OK (name=%s, size=%zu)\n",
            shm_name, buf_size);
 
-    /* Step 4: Map it locally */
+    /* Step 5: Map it locally */
     void *ptr = NULL;
     ret = ubsmem_shmem_map(NULL, buf_size,
                            PROT_READ | PROT_WRITE,
@@ -159,7 +159,7 @@ int main(int argc, char *argv[])
     }
     printf("[5/6] ubsmem_shmem_map OK: ptr=%p\n", ptr);
 
-    /* Step 5: Fill with deterministic pattern — same as scheme5 server */
+    /* Step 6: Fill with deterministic pattern — same as scheme5 server */
     float *data = (float *)ptr;
     size_t num_floats = buf_size / sizeof(float);
     printf("[6/6] Filling %zu floats (data[i] = i * 0.001f)...\n", num_floats);
