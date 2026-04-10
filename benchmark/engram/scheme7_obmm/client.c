@@ -337,21 +337,36 @@ int main(int argc, char *argv[])
      *     IMPORT fails: "0x40a is not a known scna, lookup ret=-EPERM".
      *
      *     This is what UBSE does under the hood in the ubs-mem flow —
-     *     we do it ourselves since we bypass UBSE entirely. */
+     *     we do it ourselves since we bypass UBSE entirely.
+     *
+     *     Kernel requires PA aligned to 0x8000000 (128 MB). EXPORT's
+     *     buddy allocator may place memory at a finer granularity, so
+     *     we align down and extend length to cover the original range. */
+#define PREIMPORT_PA_ALIGN  0x8000000UL  /* 128 MB — from kernel msg */
+    uint64_t aligned_pa  = wire.pa & ~(PREIMPORT_PA_ALIGN - 1);
+    uint64_t pa_adjust   = wire.pa - aligned_pa;
+    uint64_t aligned_len = wire.length + pa_adjust;
+    aligned_len = (aligned_len + PREIMPORT_PA_ALIGN - 1)
+                & ~(PREIMPORT_PA_ALIGN - 1);
+
     struct obmm_cmd_preimport pre;
     memset(&pre, 0, sizeof(pre));
-    pre.pa       = wire.pa;       /* physical address from ADDR_QUERY */
-    pre.length   = wire.length;
+    pre.pa       = aligned_pa;    /* 128 MB-aligned base */
+    pre.length   = aligned_len;   /* extended to cover original range */
     pre.flags    = 0;
-    pre.scna     = wire.scna;     /* server's CNA (must be "known" after this) */
+    pre.scna     = wire.scna;     /* server's CNA */
     pre.dcna     = local_cna;     /* our own CNA */
     pre.numa_id  = -1;            /* any NUMA */
     pre.base_dist = 0;
     memcpy(pre.seid, wire.seid, 16);
     memcpy(pre.deid, wire.deid, 16);
 
-    printf("[3a] DECLARE_PREIMPORT: scna=0x%04x dcna=0x%04x pa=0x%" PRIx64 "\n",
-           pre.scna, pre.dcna, (uint64_t)pre.pa);
+    printf("[3a] DECLARE_PREIMPORT: scna=0x%04x dcna=0x%04x\n",
+           pre.scna, pre.dcna);
+    printf("     pa=0x%" PRIx64 " (aligned from 0x%" PRIx64 ", +%" PRIu64 " MB)\n",
+           aligned_pa, wire.pa, pa_adjust / (1024*1024));
+    printf("     length=%" PRIu64 " (%.1f MB)\n",
+           aligned_len, aligned_len / (1024.0 * 1024.0));
 
     if (ioctl(fd_ctl, OBMM_CMD_DECLARE_PREIMPORT, &pre) < 0) {
         fprintf(stderr, "[FAIL 3a] DECLARE_PREIMPORT: %s (errno=%d)\n",
