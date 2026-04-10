@@ -61,12 +61,16 @@ after two days of probing mmap offsets on the wrong device.
   No custom headers, no helper libraries. Build and run it, and
   either we see `=== smoke test PASSED ===` and scheme 7 is unblocked,
   or we get a precise kernel errno telling us exactly which step
-  failed.
-- `Makefile` — tiny; just compiles `smoke_test.c` with `-std=c11`
-  and the system `<ub/obmm.h>`.
-- `server.c` / `client.c` — **to be added** after the smoke test
-  passes. Will handle the TCP handshake and the cross-node IMPORT
-  ioctl using `obmm_cmd_import.desc.{addr,tokenid,scna,dcna}`.
+  failed. **PASSED on Node1 2026-04-10.**
+- `server.c` — cross-node data server. EXPORT 2 GB, fill with
+  scheme5-compatible Engram pattern (`data[i] = i*0.001f`), TCP
+  listen, send handle struct on each accept. Mirrors
+  `scheme5_urma_rw/server.c`.
+- `client.c` — cross-node reader. TCP connect, recv handle, IMPORT,
+  open/mmap, verify row 42, run the same 3 bench loops as
+  `scheme5_urma_rw/client.c`: single-row read, batch read
+  (32/64/128/256), full Engram prefetch (12 tables × N tokens).
+- `Makefile` — three C files, three binaries, no helper lib.
 
 Deleted files (based on the prior wrong mental model):
 - `smoke_multi.c`, `smoke_export.c` — probed mmap offsets on
@@ -126,18 +130,48 @@ The test prints the result of every stage, so failures are localized:
 All of these are debuggable because the kernel source is open
 (openEuler, `drivers/ub/mem/obmm/` for the ub-pkg-mem build).
 
-### After the smoke test passes
+### Cross-node test (after smoke_test passes)
 
-1. **Cross-node server/client** — add `server.c` that allocates,
-   exports, then sends `{mem_id, tokenid, uba, scna, dcna, length}`
-   over TCP. Add `client.c` that receives that handle, fills an
-   `obmm_cmd_import.desc`, calls `OBMM_CMD_IMPORT` to get a local
-   `mem_id`, then opens `/dev/obmm_shmdev<local_mem_id>` and mmaps.
-2. **Benchmark** — same 3 bench loops as `scheme5_urma_rw`: single-
-   read, batch-read, and full Engram prefetch. Compare against the
-   0.14 ms / 128-token scheme 5 baseline.
-3. **SGLang integration** — if the numbers justify it, wire into
-   `engram_prefetcher.py` via ctypes, same shape as scheme 5.
+```bash
+# Node1 (data server)
+cd benchmark/engram/scheme7_obmm
+make clean && make
+sudo ./server                              # default: port 13857, 2 GB
+
+# Node2 (compute client)
+cd benchmark/engram/scheme7_obmm
+make clean && make
+sudo ./client 141.61.84.245 13857 10000 341 200
+```
+
+Client output format matches scheme5 exactly, so numbers can be
+diff'd directly. Key columns:
+
+- **[Verify]**: `row[42][0..3]` should match server's pattern.
+- **[Bench 1]**: single-row latency. Scheme5 = 2.65 μs (post+poll).
+  Scheme7 target: 200-500 ns (pure UB fabric load).
+- **[Bench 2]**: batch read. Scheme5 amortizes to 0.10 μs/row @256.
+  Scheme7 is per-row (no batching API); CPU prefetcher may help.
+- **[Bench 3]**: full Engram prefetch. Scheme5 hits 0.14 ms for 128
+  tokens (7× under the CXL paper target). **This is the number
+  that decides scheme7 vs scheme5 for the final integration.**
+
+### Cross-node failure modes
+
+| Symptom | Meaning | Fix |
+|---|---|---|
+| `OBMM_CMD_IMPORT: EINVAL` | identity fields (seid/scna zero) rejected | check dmesg; borrow EID from URMA (scheme5 already does) |
+| `OBMM_CMD_IMPORT: ENOMEM` | shmdev minor numbers or UBMMU entries exhausted | restart obmm module, reduce size |
+| `OBMM_CMD_IMPORT: EACCES` | tokenid mismatch | wire struct must be binary-identical both sides (same-endian aarch64 = OK) |
+| `[Verify] row[42]` shows garbage | mapping valid but wrong pages | UBMMU misprogramming; dmesg for translation errors |
+| Bench 1 > 1 μs | fabric is the limit, not OBMM overhead | scheme 7 has no edge over scheme 5 — skip integration |
+| Bench 1 < 500 ns | load/store is faster than urma_read | confirm Bench 3 for ratio that matters |
+
+### SGLang integration (after cross-node bench)
+
+If scheme 7 Bench 3 beats scheme 5's 0.14 ms by >2×, integrate via
+Python ctypes wrapping in `engram_prefetcher.py`. Otherwise keep
+scheme 5 (less plumbing).
 
 ## Design notes
 

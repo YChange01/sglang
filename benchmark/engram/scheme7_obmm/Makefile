@@ -19,18 +19,33 @@ CFLAGS  ?= -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE
 CPPFLAGS = -I/usr/include -I.
 LDFLAGS  =
 
-BINS = smoke_test
+BINS = smoke_test server client
 
 .PHONY: all clean help
 
 all: $(BINS)
 	@echo
 	@echo "Built: $(BINS)"
-	@echo "Next:  sudo ./smoke_test       # single-node loopback test"
-	@echo "       sudo ./smoke_test 16    # try a larger alloc (16 MB)"
+	@echo ""
+	@echo "Loopback validation (first):"
+	@echo "  sudo ./smoke_test             # single-node sanity check"
+	@echo ""
+	@echo "Cross-node benchmark:"
+	@echo "  # Node1 (data server):"
+	@echo "  sudo ./server                 # port 13857, 2 GB buffer"
+	@echo "  # Node2 (compute client):"
+	@echo "  sudo ./client 141.61.84.245 13857 10000 341 200"
 
 smoke_test: smoke_test.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_test.c $(LDFLAGS)
+	@echo "Built $@"
+
+server: server.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ server.c $(LDFLAGS)
+	@echo "Built $@"
+
+client: client.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ client.c $(LDFLAGS)
 	@echo "Built $@"
 
 clean:
@@ -40,10 +55,13 @@ help:
 	@echo "Scheme 7 — direct obmm UAPI"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make            build smoke_test"
-	@echo "  make smoke_test rebuild just the smoke test"
-	@echo "  make clean      remove binaries"
+	@echo "  make             build smoke_test + server + client"
+	@echo "  make smoke_test  single-node loopback"
+	@echo "  make server      cross-node data provider"
+	@echo "  make client      cross-node reader + 3 bench loops"
+	@echo "  make clean       remove binaries"
 	@echo ""
-	@echo "First run:"
-	@echo "  make clean && make"
-	@echo "  sudo ./smoke_test"
+	@echo "Run order:"
+	@echo "  1. sudo ./smoke_test              (local sanity)"
+	@echo "  2. Node1: sudo ./server"
+	@echo "     Node2: sudo ./client <node1-ip>"
