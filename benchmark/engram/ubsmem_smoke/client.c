@@ -18,6 +18,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <limits.h>
+#include <stdint.h>
 #include <math.h>
 #include <time.h>
 #include <sys/mman.h>
@@ -281,18 +282,39 @@ int main(int argc, char *argv[])
     ubsmem_set_logger_level(1);
     printf("[1/3] ubsmem_initialize OK\n");
 
-    /* Step 2: Lookup shmem info */
+    /* Step 2: Lookup shmem info (may fail on remote node) */
     ubsmem_shmem_info_t shm_info;
     int ret = ubsmem_shmem_lookup(shm_name, &shm_info);
     if (ret != 0) {
-        fprintf(stderr, "[2/3] ubsmem_shmem_lookup(\"%s\") failed: %d\n",
-                shm_name, ret);
-        fprintf(stderr, "  Is the server running?\n");
-        ubsmem_finalize();
-        return 1;
+        printf("[2/4] ubsmem_shmem_lookup(\"%s\") failed: %d (trying allocate_with_provider)\n",
+               shm_name, ret);
+
+        /* Cross-node: allocate from remote provider so local ubsmd learns about it */
+        ubs_mem_provider_t provider;
+        memset(&provider, 0, sizeof(provider));
+        /* Default provider = node1; override via env UBS_PROVIDER_HOST */
+        const char *phost = getenv("UBS_PROVIDER_HOST");
+        if (!phost) phost = "node1";
+        snprintf(provider.host_name, sizeof(provider.host_name), "%s", phost);
+        provider.socket_id = UINT32_MAX;  /* let SDK choose */
+        provider.numa_id = UINT32_MAX;
+        provider.port_id = UINT32_MAX;
+
+        printf("  Trying ubsmem_shmem_allocate_with_provider(host=%s, name=%s, size=%zu)\n",
+               phost, shm_name, buf_size);
+        ret = ubsmem_shmem_allocate_with_provider(&provider, shm_name, buf_size,
+                                                   0666, UBSM_FLAG_CACHE);
+        if (ret != 0) {
+            fprintf(stderr, "[2/4] allocate_with_provider failed: %d\n", ret);
+            /* Last resort: try map anyway */
+            printf("  Trying direct map without lookup...\n");
+        } else {
+            printf("[2/4] allocate_with_provider OK\n");
+        }
+    } else {
+        printf("[2/4] shmem lookup OK: name=%s, size=%zu, mem_num=%u\n",
+               shm_info.name, shm_info.size, shm_info.mem_num);
     }
-    printf("[2/3] shmem lookup OK: name=%s, size=%zu, mem_num=%u\n",
-           shm_info.name, shm_info.size, shm_info.mem_num);
 
     /* Step 3: Map to local VA */
     void *ptr = NULL;
@@ -301,11 +323,11 @@ int main(int argc, char *argv[])
                            MAP_SHARED,
                            shm_name, 0, &ptr);
     if (ret != 0 || !ptr) {
-        fprintf(stderr, "[3/3] ubsmem_shmem_map failed: %d\n", ret);
+        fprintf(stderr, "[3/4] ubsmem_shmem_map failed: %d\n", ret);
         ubsmem_finalize();
         return 1;
     }
-    printf("[3/3] ubsmem_shmem_map OK: ptr=%p\n\n", ptr);
+    printf("[3/4] ubsmem_shmem_map OK: ptr=%p\n\n", ptr);
 
     const float *data = (const float *)ptr;
 
