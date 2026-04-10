@@ -2,25 +2,26 @@
  * Unified Cross-Node Benchmark — All Transport Modes
  *
  * Modes:
- *   local    — Local DRAM memcpy (theoretical ceiling)
- *   tcp      — TCP socket read from server
- *   ubsmem   — ubs_mem load/store (CACHE, default)
- *   ubsmem-nc — ubs_mem load/store (NONCACHE / O_SYNC)
+ *   local       — Local DRAM memcpy (theoretical ceiling)
+ *   tcp         — TCP socket read from server
+ *   urma        — URMA urma_read (RDMA one-sided READ)
+ *   ubsmem      — ubs_mem load/store (CACHE)
+ *   ubsmem-nc   — ubs_mem load/store (NONCACHE / O_SYNC)
  *   ubsmem-huge — ubs_mem load/store (2MB hugepage)
- *   all      — Run all modes sequentially
+ *   all         — Run all modes sequentially
  *
  * Usage:
  *   ./bench_all <mode> [options]
- *   ./bench_all all [options]
  *
  * Options:
- *   --size_mb N       shmem size in MB (default 128)
+ *   --size_mb N       shmem/buffer size in MB (default 128)
  *   --name NAME       shmem object name (default "engram_test")
  *   --rows N          number of rows (default 10000)
  *   --dim N           embedding dimension (default 341)
  *   --iters N         iterations per benchmark (default 500)
- *   --server_ip IP    TCP server IP (default "192.168.84.245")
- *   --tcp_port N      TCP port (default 13900)
+ *   --server_ip IP    server IP for TCP/URMA (default "192.168.84.245")
+ *   --tcp_port N      TCP data port (default 13900)
+ *   --urma_port N     URMA seg exchange port (default 13857)
  *   --provider HOST   ubs_mem provider hostname (default "node1")
  */
 
@@ -40,8 +41,12 @@
 #include <arpa/inet.h>
 #include <ubs_mem.h>
 
+/* URMA RW library from scheme5 */
+#include "urma_rw.h"
+
 #define NUM_TABLES 12
-#define DEFAULT_TCP_PORT 13900
+#define DEFAULT_TCP_PORT  13900
+#define DEFAULT_URMA_PORT 13857
 
 /* ------------------------------------------------------------------ */
 /*  Timing helpers                                                    */
@@ -121,6 +126,7 @@ static void tcp_disconnect(int fd)
 typedef enum {
     MODE_LOCAL,
     MODE_TCP,
+    MODE_URMA,
     MODE_UBSMEM,
     MODE_UBSMEM_NC,
     MODE_UBSMEM_HUGE,
@@ -136,7 +142,10 @@ typedef struct {
     /* For TCP */
     int tcp_fd;
 
-    /* Local receive buffer for TCP reads */
+    /* For URMA */
+    urma_rw_ctx_t *urma_ctx;
+
+    /* Local receive buffer */
     float *local_buf;
     size_t local_buf_size;
 } bench_ctx_t;
@@ -160,11 +169,15 @@ static int bench_read_row(bench_ctx_t *ctx, int row, int dim)
         if (tcp_recv_all(ctx->tcp_fd, ctx->local_buf, row_bytes) != 0) return -1;
         return 0;
     }
+
+    case MODE_URMA:
+        return urma_rw_read(ctx->urma_ctx, 0,
+                            (uint64_t)row * row_bytes, row_bytes);
     }
     return -1;
 }
 
-/* Read N rows into local_buf (sequentially). */
+/* Read N rows. For URMA uses batch post+poll. */
 static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int dim)
 {
     int row_bytes = dim * (int)sizeof(float);
@@ -181,7 +194,6 @@ static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int di
         return 0;
 
     case MODE_TCP: {
-        /* Pipeline: send all requests, then read all responses */
         for (int i = 0; i < count; i++) {
             tcp_req_t req = { .offset = (uint64_t)rows[i] * row_bytes,
                               .length = row_bytes };
@@ -192,6 +204,25 @@ static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int di
                              row_bytes) != 0) return -1;
         }
         return 0;
+    }
+
+    case MODE_URMA: {
+        if (count > URMA_RW_MAX_BATCH) return -1;
+        uint64_t *locals  = (uint64_t *)malloc(count * sizeof(uint64_t));
+        uint64_t *remotes = (uint64_t *)malloc(count * sizeof(uint64_t));
+        uint32_t *lens    = (uint32_t *)malloc(count * sizeof(uint32_t));
+        if (!locals || !remotes || !lens) {
+            free(locals); free(remotes); free(lens);
+            return -1;
+        }
+        for (int i = 0; i < count; i++) {
+            locals[i]  = (uint64_t)i * row_bytes;
+            remotes[i] = (uint64_t)rows[i] * row_bytes;
+            lens[i]    = row_bytes;
+        }
+        int ret = urma_rw_read_batch(ctx->urma_ctx, locals, remotes, lens, count);
+        free(locals); free(remotes); free(lens);
+        return ret;
     }
     }
     return -1;
@@ -204,15 +235,14 @@ static int bench_read_batch(bench_ctx_t *ctx, const int *rows, int count, int di
 static void bench_single_load(bench_ctx_t *ctx, int num_rows, int dim,
                               int num_iters)
 {
-    if (ctx->mode == MODE_TCP) {
-        printf("\n  [Single float load] (skipped for TCP — not meaningful)\n");
+    if (ctx->mode == MODE_TCP || ctx->mode == MODE_URMA) {
+        printf("\n  [Single float load] (skipped for %s)\n", ctx->mode_name);
         return;
     }
 
     printf("\n  [Single float load] 4 bytes, %d iters\n", num_iters);
 
     volatile float sink = 0;
-    /* Warmup */
     for (int i = 0; i < 100; i++) sink += ctx->data_ptr[i];
 
     size_t total_floats = (size_t)num_rows * dim;
@@ -247,7 +277,6 @@ static void bench_single_row(bench_ctx_t *ctx, int num_rows, int dim,
     int row_bytes = dim * (int)sizeof(float);
     printf("\n  [Single-row read] %d bytes, %d iters\n", row_bytes, num_iters);
 
-    /* Warmup */
     for (int i = 0; i < 10; i++) bench_read_row(ctx, i % num_rows, dim);
 
     struct timespec t0, t1;
@@ -346,18 +375,16 @@ static void bench_engram_prefetch(bench_ctx_t *ctx, int num_rows, int dim,
 
 static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
 {
-    if (ctx->mode == MODE_TCP) {
-        printf("\n  [Cold/Hot analysis] (skipped for TCP)\n");
+    if (ctx->mode == MODE_TCP || ctx->mode == MODE_URMA) {
+        printf("\n  [Cold/Hot analysis] (skipped for %s)\n", ctx->mode_name);
         return;
     }
 
     int row_bytes = dim * (int)sizeof(float);
     printf("\n  [Cold/Hot analysis] first access vs cached\n");
 
-    /* We can't truly evict TLB/cache, but we can measure first-touch vs repeat */
     struct timespec t0, t1;
 
-    /* Cold: access pages that haven't been touched */
     int cold_rows[] = {0, num_rows/4, num_rows/2, num_rows*3/4, num_rows-1};
     int ncold = 5;
     if (cold_rows[4] >= num_rows) cold_rows[4] = num_rows - 1;
@@ -369,13 +396,11 @@ static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
         int row = cold_rows[r];
         if (row >= num_rows) continue;
 
-        /* "Cold" — first read (may involve page fault / TLB miss) */
         clock_gettime(CLOCK_MONOTONIC, &t0);
         memcpy(ctx->local_buf, ctx->data_ptr + (size_t)row * dim, row_bytes);
         clock_gettime(CLOCK_MONOTONIC, &t1);
         double cold_us = diff_us(&t0, &t1);
 
-        /* "Hot" — re-read same row (TLB cached) */
         clock_gettime(CLOCK_MONOTONIC, &t0);
         memcpy(ctx->local_buf, ctx->data_ptr + (size_t)row * dim, row_bytes);
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -395,8 +420,11 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
 
     /* Verify data */
     bench_read_row(ctx, 42, dim);
+    float *verify_buf = (ctx->mode == MODE_URMA)
+        ? (float *)urma_rw_get_buffer(ctx->urma_ctx)
+        : ctx->local_buf;
     float expected = 42.0f * dim * 0.001f;
-    float actual = ctx->local_buf[0];
+    float actual = verify_buf[0];
     printf("  Verify row[42][0]: got=%.4f expect=%.4f %s\n",
            actual, expected, fabsf(actual - expected) < 0.01f ? "OK" : "MISMATCH");
 
@@ -425,11 +453,9 @@ static const float *setup_ubsmem(const char *shm_name, size_t buf_size,
                                   const char *provider_host, uint64_t flags,
                                   void **out_ptr)
 {
-    /* Try lookup first (same node) */
     ubsmem_shmem_info_t info;
     int ret = ubsmem_shmem_lookup(shm_name, &info);
     if (ret != 0) {
-        /* Cross-node: allocate_with_provider */
         ubs_mem_provider_t prov;
         memset(&prov, 0, sizeof(prov));
         snprintf(prov.host_name, sizeof(prov.host_name), "%s", provider_host);
@@ -440,15 +466,11 @@ static const float *setup_ubsmem(const char *shm_name, size_t buf_size,
                                                    0666, flags);
         if (ret != 0 && ret != UBSM_ERR_ALREADY_EXIST) {
             fprintf(stderr, "  ubsmem allocate_with_provider failed: %d\n", ret);
-            /* try map anyway */
         }
     }
 
     void *ptr = NULL;
-    int prot = PROT_READ;
-    int map_flags = MAP_SHARED;
-
-    ret = ubsmem_shmem_map(NULL, buf_size, prot, map_flags, shm_name, 0, &ptr);
+    ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ, MAP_SHARED, shm_name, 0, &ptr);
     if (ret != 0 || !ptr) {
         fprintf(stderr, "  ubsmem_shmem_map failed: %d\n", ret);
         return NULL;
@@ -456,6 +478,33 @@ static const float *setup_ubsmem(const char *shm_name, size_t buf_size,
     printf("  ubs_mem mapped: ptr=%p, flags=0x%lx\n", ptr, (unsigned long)flags);
     *out_ptr = ptr;
     return (const float *)ptr;
+}
+
+static urma_rw_ctx_t *setup_urma(const char *server_ip, uint16_t port,
+                                  size_t local_buf_size)
+{
+    urma_rw_ctx_t *ctx = urma_rw_init(NULL, local_buf_size);
+    if (!ctx) {
+        fprintf(stderr, "  urma_rw_init failed\n");
+        return NULL;
+    }
+    printf("  Connecting to URMA server %s:%u...\n", server_ip, port);
+    if (urma_rw_client_connect(ctx, server_ip, port) != 0) {
+        fprintf(stderr, "  urma_rw_client_connect failed\n");
+        urma_rw_destroy(ctx);
+        return NULL;
+    }
+    printf("  URMA connected\n");
+    return ctx;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Mode matching helper                                              */
+/* ------------------------------------------------------------------ */
+
+static bool mode_match(const char *mode_str, const char *target)
+{
+    return strcmp(mode_str, target) == 0 || strcmp(mode_str, "all") == 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -472,27 +521,29 @@ int main(int argc, char *argv[])
     int num_iters = 500;
     const char *server_ip = "192.168.84.245";
     uint16_t tcp_port = DEFAULT_TCP_PORT;
+    uint16_t urma_port = DEFAULT_URMA_PORT;
     const char *provider_host = "node1";
     const char *mode_str = "all";
 
-    /* Parse args */
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <mode> [options]\n"
-                "  mode: local, tcp, ubsmem, ubsmem-nc, ubsmem-huge, all\n"
+                "  mode: local, tcp, urma, ubsmem, ubsmem-nc, ubsmem-huge, all\n"
                 "  --size_mb N  --name NAME  --rows N  --dim N  --iters N\n"
-                "  --server_ip IP  --tcp_port N  --provider HOST\n", argv[0]);
+                "  --server_ip IP  --tcp_port N  --urma_port N  --provider HOST\n",
+                argv[0]);
         return 1;
     }
     mode_str = argv[1];
 
     for (int i = 2; i < argc - 1; i++) {
-        if (strcmp(argv[i], "--size_mb") == 0)     size_mb = (size_t)atol(argv[++i]);
-        else if (strcmp(argv[i], "--name") == 0)    shm_name = argv[++i];
-        else if (strcmp(argv[i], "--rows") == 0)    num_rows = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--dim") == 0)     dim = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--iters") == 0)   num_iters = atoi(argv[++i]);
+        if (strcmp(argv[i], "--size_mb") == 0)       size_mb = (size_t)atol(argv[++i]);
+        else if (strcmp(argv[i], "--name") == 0)      shm_name = argv[++i];
+        else if (strcmp(argv[i], "--rows") == 0)      num_rows = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dim") == 0)       dim = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--iters") == 0)     num_iters = atoi(argv[++i]);
         else if (strcmp(argv[i], "--server_ip") == 0) server_ip = argv[++i];
         else if (strcmp(argv[i], "--tcp_port") == 0)  tcp_port = (uint16_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--urma_port") == 0) urma_port = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--provider") == 0)  provider_host = argv[++i];
     }
 
@@ -505,22 +556,19 @@ int main(int argc, char *argv[])
     printf("Mode: %s\n", mode_str);
     printf("Table: %d rows x %d dim = %d bytes/row\n", num_rows, dim, row_bytes);
     printf("shmem: %s, size: %zu MB, iters: %d\n", shm_name, size_mb, num_iters);
-    printf("server: %s:%u, provider: %s\n\n", server_ip, tcp_port, provider_host);
+    printf("server: %s, tcp:%u, urma:%u, provider: %s\n\n",
+           server_ip, tcp_port, urma_port, provider_host);
 
-    /* Allocate local receive buffer (shared across modes) */
     float *local_buf = (float *)malloc(local_buf_size);
     if (!local_buf) { perror("malloc local_buf"); return 1; }
 
-    /* Initialize ubs_mem library (needed for ubsmem modes) */
+    /* Initialize ubs_mem library if needed */
     bool ubsmem_inited = false;
-    bool want_ubsmem = (strcmp(mode_str, "ubsmem") == 0 ||
-                        strcmp(mode_str, "ubsmem-nc") == 0 ||
-                        strcmp(mode_str, "ubsmem-huge") == 0 ||
-                        strcmp(mode_str, "all") == 0);
-    if (want_ubsmem) {
+    if (mode_match(mode_str, "ubsmem") || mode_match(mode_str, "ubsmem-nc") ||
+        mode_match(mode_str, "ubsmem-huge")) {
         ubsmem_options_t opts;
         if (ubsmem_init_attributes(&opts) == 0 && ubsmem_initialize(&opts) == 0) {
-            ubsmem_set_logger_level(2);  /* warning only */
+            ubsmem_set_logger_level(2);
             ubsmem_inited = true;
             printf("[init] ubs_mem library OK\n");
         } else {
@@ -528,8 +576,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Mode: LOCAL ---- */
-    if (strcmp(mode_str, "local") == 0 || strcmp(mode_str, "all") == 0) {
+    /* ---- LOCAL ---- */
+    if (mode_match(mode_str, "local")) {
         const float *ldata = setup_local(buf_size);
         if (ldata) {
             bench_ctx_t ctx = { .mode = MODE_LOCAL, .mode_name = "LOCAL DRAM",
@@ -540,8 +588,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Mode: TCP ---- */
-    if (strcmp(mode_str, "tcp") == 0 || strcmp(mode_str, "all") == 0) {
+    /* ---- TCP ---- */
+    if (mode_match(mode_str, "tcp")) {
         int tcp_fd = tcp_connect(server_ip, tcp_port);
         if (tcp_fd >= 0) {
             bench_ctx_t ctx = { .mode = MODE_TCP, .mode_name = "TCP",
@@ -554,13 +602,27 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Mode: UBSMEM (CACHE) ---- */
-    if ((strcmp(mode_str, "ubsmem") == 0 || strcmp(mode_str, "all") == 0) && ubsmem_inited) {
+    /* ---- URMA (RDMA READ) ---- */
+    if (mode_match(mode_str, "urma")) {
+        urma_rw_ctx_t *uctx = setup_urma(server_ip, urma_port, local_buf_size);
+        if (uctx) {
+            bench_ctx_t ctx = { .mode = MODE_URMA,
+                                .mode_name = "URMA (RDMA READ)",
+                                .urma_ctx = uctx, .local_buf = local_buf,
+                                .local_buf_size = local_buf_size };
+            run_benchmarks(&ctx, num_rows, dim, num_iters);
+            urma_rw_destroy(uctx);
+        }
+    }
+
+    /* ---- UBSMEM (CACHE) ---- */
+    if (mode_match(mode_str, "ubsmem") && ubsmem_inited) {
         void *uptr = NULL;
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_CACHE, &uptr);
         if (udata) {
-            bench_ctx_t ctx = { .mode = MODE_UBSMEM, .mode_name = "UBS-MEM (cache)",
+            bench_ctx_t ctx = { .mode = MODE_UBSMEM,
+                                .mode_name = "UBS-MEM (cache)",
                                 .data_ptr = udata, .local_buf = local_buf,
                                 .local_buf_size = local_buf_size };
             run_benchmarks(&ctx, num_rows, dim, num_iters);
@@ -568,8 +630,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Mode: UBSMEM NONCACHE ---- */
-    if ((strcmp(mode_str, "ubsmem-nc") == 0 || strcmp(mode_str, "all") == 0) && ubsmem_inited) {
+    /* ---- UBSMEM NONCACHE ---- */
+    if (mode_match(mode_str, "ubsmem-nc") && ubsmem_inited) {
         void *uptr = NULL;
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_NONCACHE, &uptr);
@@ -583,8 +645,8 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* ---- Mode: UBSMEM HUGEPAGE ---- */
-    if ((strcmp(mode_str, "ubsmem-huge") == 0 || strcmp(mode_str, "all") == 0) && ubsmem_inited) {
+    /* ---- UBSMEM HUGEPAGE ---- */
+    if (mode_match(mode_str, "ubsmem-huge") && ubsmem_inited) {
         void *uptr = NULL;
         const float *udata = setup_ubsmem(shm_name, buf_size, provider_host,
                                            UBSM_FLAG_MMAP_HUGETLB_PMD, &uptr);
