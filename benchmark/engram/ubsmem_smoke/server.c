@@ -58,6 +58,8 @@ int main(int argc, char *argv[])
     ubsmem_set_logger_level(1);  /* info */
     printf("[1/5] ubsmem_initialize OK\n");
 
+    int ret;
+
     /* Step 2: Query cluster info */
     ubsmem_cluster_info_t cinfo;
     if (ubsmem_lookup_cluster_statistic(&cinfo) == 0) {
@@ -79,9 +81,11 @@ int main(int argc, char *argv[])
 
     /* Step 3: Allocate named shmem object */
     /* Try to deallocate first in case leftover from previous run */
-    ubsmem_shmem_deallocate(shm_name);
+    ret = ubsmem_shmem_deallocate(shm_name);
+    if (ret == 0)
+        printf("  (cleaned up leftover shmem \"%s\")\n", shm_name);
 
-    int ret = ubsmem_shmem_allocate(NULL, shm_name, buf_size,
+    ret = ubsmem_shmem_allocate(NULL, shm_name, buf_size,
                                     0666, UBSM_FLAG_CACHE);
     if (ret != 0) {
         fprintf(stderr, "[3/5] ubsmem_shmem_allocate failed: %d\n", ret);

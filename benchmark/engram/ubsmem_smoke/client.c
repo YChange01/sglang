@@ -47,7 +47,7 @@ static int verify_data(const float *data, int num_rows, int dim)
         int row = check_rows[r];
         if (row >= num_rows) continue;
 
-        int base = row * dim;
+        size_t base = (size_t)row * dim;
         float expected0 = (float)base * 0.001f;
         float expected1 = (float)(base + 1) * 0.001f;
         float actual0 = data[base];
@@ -216,9 +216,15 @@ static void bench_single_load(const float *remote, int num_rows, int dim,
     double total_ns = 0, min_ns = 1e12, max_ns = 0;
     size_t total_floats = (size_t)num_rows * dim;
 
+    /* Pre-generate random indices to keep rand() out of timed region */
+    size_t *indices = (size_t *)malloc(num_iters * sizeof(size_t));
+    if (!indices) return;
     srand(123);
+    for (int i = 0; i < num_iters; i++)
+        indices[i] = (size_t)(rand() % (int)(total_floats > INT_MAX ? INT_MAX : total_floats));
+
     for (int i = 0; i < num_iters; i++) {
-        size_t idx = (size_t)(rand() % (int)total_floats);
+        size_t idx = indices[i];
         clock_gettime(CLOCK_MONOTONIC, &t0);
         sink = remote[idx];
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -233,6 +239,7 @@ static void bench_single_load(const float *remote, int num_rows, int dim,
            avg, min_ns, max_ns);
     printf("  (clock_gettime overhead ~20-30ns included)\n");
     (void)sink;
+    free(indices);
 }
 
 /* ------------------------------------------------------------------ */
