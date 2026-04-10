@@ -406,6 +406,116 @@ static void bench_cold_hot(bench_ctx_t *ctx, int num_rows, int dim)
 }
 
 /* ------------------------------------------------------------------ */
+/*  Paper reproduction: Engram-27B (arXiv:2603.10087 Figure 3/5)      */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Engram-27B parameters:
+ *   vocab_size = 2,262,400; emb_dim = 1,280
+ *   Per token: 8 hash-mapped segments, each 320 bytes, sparse addresses
+ *   Batch sizes: 1, 4, 16, 64, 256, 1024
+ */
+#define PAPER_SEGS_PER_TOKEN  8
+#define PAPER_SEG_BYTES       320
+#define PAPER_SEG_FLOATS      (PAPER_SEG_BYTES / (int)sizeof(float))  /* 80 */
+
+static void bench_paper_read_batch(bench_ctx_t *ctx, const uint64_t *offsets,
+                                    int count, size_t data_size)
+{
+    switch (ctx->mode) {
+    case MODE_LOCAL:
+    case MODE_UBSMEM:
+    case MODE_UBSMEM_NC:
+    case MODE_UBSMEM_HUGE:
+        for (int i = 0; i < count; i++) {
+            memcpy((char *)ctx->local_buf + (size_t)i * PAPER_SEG_BYTES,
+                   (const char *)ctx->data_ptr + offsets[i],
+                   PAPER_SEG_BYTES);
+        }
+        break;
+
+    case MODE_TCP:
+        for (int i = 0; i < count; i++) {
+            tcp_req_t req = { .offset = offsets[i], .length = PAPER_SEG_BYTES };
+            tcp_send_all(ctx->tcp_fd, &req, sizeof(req));
+        }
+        for (int i = 0; i < count; i++) {
+            tcp_recv_all(ctx->tcp_fd, (char *)ctx->local_buf + (size_t)i * PAPER_SEG_BYTES,
+                         PAPER_SEG_BYTES);
+        }
+        break;
+
+    case MODE_URMA: {
+        static uint64_t s_locals[URMA_RW_MAX_BATCH];
+        static uint64_t s_remotes[URMA_RW_MAX_BATCH];
+        static uint32_t s_lens[URMA_RW_MAX_BATCH];
+        for (int i = 0; i < count; i++) {
+            s_locals[i]  = (uint64_t)i * PAPER_SEG_BYTES;
+            s_remotes[i] = offsets[i];
+            s_lens[i]    = PAPER_SEG_BYTES;
+        }
+        urma_rw_read_batch(ctx->urma_ctx, s_locals, s_remotes, s_lens, count);
+        break;
+    }
+    }
+}
+
+static void bench_paper_27b(bench_ctx_t *ctx, size_t data_size, int num_iters)
+{
+    int batch_sizes[] = {1, 4, 16, 64, 256, 1024};
+    int nbatches = 6;
+
+    printf("\n  [Paper: Engram-27B] 8 segs x 320B per token, sparse\n");
+    printf("    %-8s %-8s %-10s %-12s %-12s\n",
+           "Batch", "Reads", "Data", "Latency", "Throughput");
+    printf("    -----------------------------------------------------------\n");
+
+    /* Max offset: ensure segment fits within data_size */
+    uint64_t max_offset = data_size - PAPER_SEG_BYTES;
+
+    for (int b = 0; b < nbatches; b++) {
+        int batch = batch_sizes[b];
+        int total_segs = batch * PAPER_SEGS_PER_TOKEN;
+
+        if (total_segs > URMA_RW_MAX_BATCH && ctx->mode == MODE_URMA) {
+            printf("    %-8d (skipped: %d > URMA_RW_MAX_BATCH)\n", batch, total_segs);
+            continue;
+        }
+
+        uint64_t *offsets = (uint64_t *)malloc(total_segs * sizeof(uint64_t));
+        if (!offsets) continue;
+
+        struct timespec t0, t1;
+        double total_us = 0;
+
+        for (int iter = 0; iter < num_iters; iter++) {
+            /* Generate sparse random offsets (320-byte aligned for realism) */
+            for (int i = 0; i < total_segs; i++) {
+                offsets[i] = ((uint64_t)(rand() % (int)(max_offset / PAPER_SEG_BYTES)))
+                             * PAPER_SEG_BYTES;
+            }
+            clock_gettime(CLOCK_MONOTONIC, &t0);
+            bench_paper_read_batch(ctx, offsets, total_segs, data_size);
+            clock_gettime(CLOCK_MONOTONIC, &t1);
+            total_us += diff_us(&t0, &t1);
+        }
+
+        double avg_us = total_us / num_iters;
+        double data_kb = (double)total_segs * PAPER_SEG_BYTES / 1024.0;
+        double throughput_mbs = (data_kb / 1024.0) / (avg_us / 1e6);
+
+        if (avg_us >= 1000.0) {
+            printf("    %-8d %-8d %-8.1fKB %-10.2fms %.1f MB/s\n",
+                   batch, total_segs, data_kb, avg_us / 1000.0, throughput_mbs);
+        } else {
+            printf("    %-8d %-8d %-8.1fKB %-10.2fus %.1f MB/s\n",
+                   batch, total_segs, data_kb, avg_us, throughput_mbs);
+        }
+        free(offsets);
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /*  Run all benchmarks for one mode                                   */
 /* ------------------------------------------------------------------ */
 
@@ -431,6 +541,7 @@ static void run_benchmarks(bench_ctx_t *ctx, int num_rows, int dim, int num_iter
     bench_single_row(ctx, num_rows, dim, num_iters);
     bench_batch(ctx, num_rows, dim, num_iters);
     bench_engram_prefetch(ctx, num_rows, dim, num_iters);
+    bench_paper_27b(ctx, (size_t)num_rows * dim * sizeof(float), num_iters);
     bench_cold_hot(ctx, num_rows, dim);
 }
 
