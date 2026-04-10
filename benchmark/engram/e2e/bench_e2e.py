@@ -4,16 +4,12 @@
 Reproduces Table 2 and Table 3 from arXiv:2603.10087.
 
 Commands:
-  retrieval   — Engram retrieval only (no LLM, pure transport benchmark)
-  table2-sim  — Simulated LLM forward pass (busy-wait compute + real retrieval)
-  table2      — Real SGLang + Qwen3-8B inference throughput
+  retrieval — Engram retrieval only (no LLM, pure transport benchmark)
+  table2    — Real SGLang + Qwen3-8B inference throughput
 
 Usage:
   # Retrieval only (no GPU needed)
   python bench_e2e.py retrieval --all
-
-  # Simulated Table 2 (no GPU needed)
-  python bench_e2e.py table2-sim --all
 
   # Real Table 2 with SGLang (requires GPU)
   python bench_e2e.py table2 --model /tmp/g00872988/Qwen3-8B
@@ -127,88 +123,6 @@ def run_retrieval(args: argparse.Namespace) -> None:
         finally:
             backend.teardown()
 
-
-# ================================================================== #
-#  Table 2 simulated (busy-wait compute + real retrieval)             #
-# ================================================================== #
-
-
-def simulate_llm_forward(
-    backend: EngramBackend, config: EngramConfig,
-    batch_size: int, seq_len: int, num_layers: int,
-    engram_layers: List[int], compute_ms_per_layer: float,
-) -> dict:
-    total_compute_ms = 0
-    total_engram_ms = 0
-    token_ids = np.random.randint(0, config.vocab_size, size=batch_size, dtype=np.int32)
-
-    for layer in range(num_layers):
-        deadline = time.perf_counter() + compute_ms_per_layer / 1000
-        while time.perf_counter() < deadline:
-            pass
-        total_compute_ms += compute_ms_per_layer
-
-        if layer in engram_layers:
-            t0 = time.perf_counter()
-            backend.fetch_all_tables(config, token_ids)
-            t1 = time.perf_counter()
-            total_engram_ms += (t1 - t0) * 1000
-
-    total_ms = total_compute_ms + total_engram_ms
-    tokens = batch_size * seq_len
-    throughput = tokens / (total_ms / 1000) if total_ms > 0 else 0
-
-    return {
-        "total_ms": total_ms, "compute_ms": total_compute_ms,
-        "engram_ms": total_engram_ms, "throughput_tps": throughput,
-    }
-
-
-def run_table2_sim(args: argparse.Namespace) -> None:
-    config = EngramConfig(
-        num_tables=args.num_tables, embedding_dim=args.dim, vocab_size=args.vocab_size,
-    )
-    num_layers = args.num_layers
-    engram_layers = [1, 14]
-    compute_per_layer = args.compute_ms
-    backends_to_test = E2E_BACKENDS if args.all else [args.backend]
-
-    baseline_ms = num_layers * compute_per_layer
-    baseline_tps = (args.batch_size * args.seq_len) / (baseline_ms / 1000)
-
-    print(f"\n{'=' * 70}")
-    print(f"  Table 2 (Simulated): LLM Throughput with Engram")
-    print(f"  {num_layers} layers, batch={args.batch_size}, seq_len={args.seq_len}, "
-          f"compute={compute_per_layer}ms/layer")
-    print(f"  Engram: {config.num_tables} tables x {config.embedding_dim} dim")
-    print(f"{'=' * 70}")
-    print(f"  {'Configuration':<30}  {'Throughput':>12}  {'Engram ms':>12}  {'Overhead':>10}")
-    print(f"  {'-' * 70}")
-    print(f"  {'Baseline (no Engram)':<30}  {baseline_tps:>10.1f} t/s  {'N/A':>12}  {'0%':>10}")
-
-    for backend_name in backends_to_test:
-        kwargs = _backend_kwargs(backend_name, args)
-        backend = create_backend(backend_name, **kwargs)
-        try:
-            backend.setup(config)
-            totals = {"engram_ms": 0, "throughput_tps": 0}
-            for _ in range(args.iters):
-                r = simulate_llm_forward(
-                    backend, config, args.batch_size, args.seq_len,
-                    num_layers, engram_layers, compute_per_layer,
-                )
-                totals["engram_ms"] += r["engram_ms"]
-                totals["throughput_tps"] += r["throughput_tps"]
-            avg_engram = totals["engram_ms"] / args.iters
-            avg_tps = totals["throughput_tps"] / args.iters
-            overhead = (1 - avg_tps / baseline_tps) * 100
-            label = f"+Engram ({backend_name.upper()})"
-            print(f"  {label:<30}  {avg_tps:>10.1f} t/s  {avg_engram:>10.2f} ms  "
-                  f"{overhead:>9.1f}%")
-        except Exception as e:
-            print(f"  +Engram ({backend_name.upper()}): FAILED - {e}")
-        finally:
-            backend.teardown()
 
 
 # ================================================================== #
@@ -433,20 +347,6 @@ def main():
     pr.add_argument("--iters", type=int, default=100)
     pr.add_argument("--server_ip", default=None)
 
-    # --- table2-sim ---
-    ps = sub.add_parser("table2-sim", help="Simulated Table 2")
-    ps.add_argument("--backend", default="local", choices=list(BACKENDS))
-    ps.add_argument("--all", action="store_true")
-    ps.add_argument("--batch_size", type=int, default=256)
-    ps.add_argument("--seq_len", type=int, default=512)
-    ps.add_argument("--num_layers", type=int, default=36)
-    ps.add_argument("--num_tables", type=int, default=12)
-    ps.add_argument("--dim", type=int, default=341)
-    ps.add_argument("--vocab_size", type=int, default=10000)
-    ps.add_argument("--compute_ms", type=float, default=0.1)
-    ps.add_argument("--iters", type=int, default=20)
-    ps.add_argument("--server_ip", default=None)
-
     # --- table2 (real) ---
     p2 = sub.add_parser("table2", help="Real Table 2: SGLang + Qwen3-8B")
     p2.add_argument("--model", default="/tmp/g00872988/Qwen3-8B")
@@ -459,8 +359,6 @@ def main():
 
     if args.command == "retrieval":
         run_retrieval(args)
-    elif args.command == "table2-sim":
-        run_table2_sim(args)
     elif args.command == "table2":
         run_table2_real(args)
     else:
