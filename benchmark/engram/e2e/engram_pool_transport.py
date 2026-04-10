@@ -227,8 +227,11 @@ class UBSMemBackend(EngramBackend):
         self.lib = ctypes.CDLL("libubsm_sdk.so")
         self.buf_size = config.vocab_size * config.row_bytes
         # Ensure buf_size >= 128 MB (obmm block alignment)
-        if self.buf_size < 128 * 1024 * 1024:
-            self.buf_size = 128 * 1024 * 1024
+        # Round up to multiple of row_bytes so reshape works
+        min_size = 128 * 1024 * 1024
+        if self.buf_size < min_size:
+            num_rows_fit = (min_size + config.row_bytes - 1) // config.row_bytes
+            self.buf_size = num_rows_fit * config.row_bytes
 
         # Initialize
         opts = ctypes.create_string_buffer(256)  # ubsmem_options_t
@@ -331,17 +334,17 @@ class URMABackend(EngramBackend):
         n = len(row_ids)
         row_bytes = self.row_bytes
 
-        locals_arr = (ctypes.c_uint64 * n)()
-        remotes_arr = (ctypes.c_uint64 * n)()
-        lens_arr = (ctypes.c_uint32 * n)()
-
-        for i, rid in enumerate(row_ids):
-            locals_arr[i] = i * row_bytes
-            remotes_arr[i] = int(rid) * row_bytes
-            lens_arr[i] = row_bytes
+        # Build offset arrays via numpy (faster than Python loop)
+        locals_np = (np.arange(n, dtype=np.uint64) * row_bytes)
+        remotes_np = (row_ids.astype(np.uint64) * row_bytes)
+        lens_np = np.full(n, row_bytes, dtype=np.uint32)
 
         ret = self.lib.urma_rw_read_batch(
-            self.ctx, locals_arr, remotes_arr, lens_arr, ctypes.c_uint32(n)
+            self.ctx,
+            locals_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            remotes_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint64)),
+            lens_np.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+            ctypes.c_uint32(n),
         )
         if ret != 0:
             raise RuntimeError(f"urma_rw_read_batch failed: {ret}")

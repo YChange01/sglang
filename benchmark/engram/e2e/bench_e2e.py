@@ -158,8 +158,10 @@ def simulate_llm_forward(
     token_ids = np.random.randint(0, config.vocab_size, size=batch_size, dtype=np.int32)
 
     for layer in range(num_layers):
-        # Transformer layer compute (simulated)
-        time.sleep(compute_time_per_layer_ms / 1000)
+        # Transformer layer compute (simulated via busy-wait for sub-ms precision)
+        deadline = time.perf_counter() + compute_time_per_layer_ms / 1000
+        while time.perf_counter() < deadline:
+            pass
         total_compute_ms += compute_time_per_layer_ms
 
         # Engram layer (real retrieval)
@@ -265,7 +267,7 @@ def run_retrieval(args: argparse.Namespace) -> None:
     )
 
     batch_sizes = [1, 4, 16, 64, 128, 256]
-    backends_to_test = list(BACKENDS.keys()) if args.all else [args.backend]
+    backends_to_test = ["local", "urma", "ubsmem"] if args.all else [args.backend]
 
     for backend_name in backends_to_test:
         kwargs = _backend_kwargs(backend_name, args)
