@@ -2,58 +2,78 @@
 
 ## What this is
 
-An alternative load/store path for cross-node Engram access that
-**bypasses the closed-source `libubsm_sdk.so` entirely** and talks
-directly to the GPL kernel UAPI at `/dev/obmm`.
+A load/store path for cross-node Engram access that **bypasses every
+Huawei userspace component** — no `libubsm_sdk.so`, no open-source
+`libubs_mem.so`, no `libubse.so`, no `ubsmd` daemon. We speak directly
+to the GPL kernel UAPI at `/dev/obmm` via ioctl, and to the per-mem_id
+data device `/dev/obmm_shmdev<id>` via `mmap(2)`.
 
-This was written after scheme 6 got stuck on a `daemon error 800`
-inside `libubsm_sdk.so` that we could not debug because the SDK is
-a binary blob. The kernel UAPI, by contrast, is documented at
-`/usr/include/ub/obmm.h` (186 lines, `SPDX-License-Identifier:
-GPL-2.0+`) and we can read the kernel source if needed.
+This was written after reverse-engineering the open-source
+[ubs-mem](https://gitcode.com/openeuler/ubs-mem) project, specifically:
+
+- `src/app_lib/mxm_shm_lib/RackMemShm.cpp:131-177` — the mmap loop
+- `src/app_lib/common/rack_mem_lib_common.h:47-65` — `ObmmOpenInternal`
+- `src/app_lib/common/rack_mem_libobmm.h:26` — `/dev/obmm_shmdev%lu` path
+
+These three files reveal the actual load/store flow that `ubs-mem` uses
+at the SDK layer, and show that after an EXPORT ioctl we can drive the
+data plane entirely with plain `open(2) + mmap(2)`.
 
 ## Architecture
 
 ```
-app                      obmm_rw.c          /dev/obmm       ummu/UBMMU    UB fabric
-───                      ──────────          ─────────       ──────────    ─────────
-export_pid(va, len) ──► ioctl EXPORT_PID ──► kernel pins pages,
-                                             returns mem_id+tokenid+uba
-                                                    │
-                                 TCP handle (mem_id, tokenid, seid, deid, length)
-                                                    ▼
-import(handle)      ──► ioctl IMPORT       ──► kernel allocates local VA,
-                                                programs UBMMU to forward
-                                                faults over UB fabric,
-                                                returns local addr
-*(T*)addr           ──────────────────────► UBMMU page walks ──► UB fabric ──► remote
-                                                                                 DRAM
+user process                    /dev/obmm             obmm driver      UBMMU/UB fabric
+────────────                    ────────────          ──────────       ───────────────
+1. open /dev/obmm        ──►    ctl fd
+2. ioctl EXPORT          ──►    allocate length bytes
+                                 on NUMA 0 via buddy
+                                 highmem, register
+                                 mem_id + tokenid
+                         ◄──    {mem_id, tokenid, uba}
+                                 kernel auto-creates
+                                 /dev/obmm_shmdev<id>
+
+3. open shmdev<id>       ──►    data fd
+4. mmap(data_fd,                establish user VA
+    offset=0             ──►    backed by the page
+    or HUGETLB_PMD)              pool via UBMMU
+
+5. *(volatile T*)va      ──────────────────────────►  direct access
+                                                       (single-node: local DRAM)
+                                                       (cross-node:  UB fabric)
+
+6. munmap / close
+7. ioctl UNEXPORT        ──►    releases pages
 ```
 
-**Key difference from scheme 5 (URMA urma_read):** no `post_jetty_send_wr`,
-no completion queue, no polling. A load of `*addr` faults through UBMMU
-which resolves it across the fabric. Expected to drop single-read
-latency from scheme 5's ~2.65 μs (post+poll overhead) to something
-closer to raw fabric round-trip (~0.2 μs per the CXL paper).
+The magic is step 4: the `offset` parameter is **not a byte offset**,
+it's a bitfield of kernel flags. Valid values:
 
-**Key difference from scheme 6 (libubsm_sdk.so):** we own every byte
-of the ioctl payload. No closed SDK between us and the kernel. Every
-failure mode has a readable source of truth.
+- `0` — normal 4 KB pages
+- `OBMM_MMAP_FLAG_HUGETLB_PMD` (`1UL << 63`) — 2 MB huge pages
+
+That one insight (offset = flag, not bytes) is what unstuck scheme 7
+after two days of probing mmap offsets on the wrong device.
 
 ## Files
 
-- `obmm_rw.h` / `obmm_rw.c` — thin wrapper over `/dev/obmm` ioctls.
-  Opaque `obmm_rw_ctx_t` holds the fd; `obmm_rw_handle_t` is the
-  80-byte wire-format handle that crosses nodes via TCP.
-- `smoke_test.c` — **single-node loopback sanity check**. Export a
-  local buffer, import it back in the same process, verify the
-  pattern reads correctly through the imported VA. Also measures a
-  quick loopback load latency as a sanity bench.
-- `server.c` / `client.c` — **(to be added)** cross-node
-  exporter + importer with TCP handle exchange. Mirror structure of
-  `scheme5_urma_rw/`.
-- `Makefile` — no link to `libubsm_sdk.so`, only standard libc +
-  kernel headers.
+- `smoke_test.c` — fully self-contained single-node loopback test.
+  No custom headers, no helper libraries. Build and run it, and
+  either we see `=== smoke test PASSED ===` and scheme 7 is unblocked,
+  or we get a precise kernel errno telling us exactly which step
+  failed.
+- `Makefile` — tiny; just compiles `smoke_test.c` with `-std=c11`
+  and the system `<ub/obmm.h>`.
+- `server.c` / `client.c` — **to be added** after the smoke test
+  passes. Will handle the TCP handshake and the cross-node IMPORT
+  ioctl using `obmm_cmd_import.desc.{addr,tokenid,scna,dcna}`.
+
+Deleted files (based on the prior wrong mental model):
+- `smoke_multi.c`, `smoke_export.c` — probed mmap offsets on
+  `/dev/obmm` (control device), which is the wrong target.
+- `obmm_rw.c`, `obmm_rw.h` — wrapped `OBMM_CMD_EXPORT_PID` which
+  always returns ENOTSUP on this kernel (export-existing-VA path
+  is reserved for in-kernel callers).
 
 ## How to build and run
 
@@ -61,103 +81,103 @@ failure mode has a readable source of truth.
 
 ```bash
 cd benchmark/engram/scheme7_obmm
-make clean && make smoke_test
-sudo ./smoke_test            # /dev/obmm typically requires root
-# or:  sudo ./smoke_test 16   # 16 MB buffer
+make clean && make
+sudo ./smoke_test            # 4 MB default
+sudo ./smoke_test 16         # 16 MB
 ```
 
 Expected output on success:
 
 ```
-=== scheme7 obmm smoke test ===
-  buffer = 4.00 MB (4MB-aligned)
+=== scheme7 obmm loopback smoke test ===
+  buffer = 4.00 MB (4MB-aligned, 4194304 bytes)
+  strategy: EXPORT → /dev/obmm_shmdev<id> → mmap → load/store
 
-[obmm_rw INFO] opened /dev/obmm -> fd=3
-  allocated va = 0x...
-  wrote 1 KB pattern via original VA
-[obmm_rw INFO] ioctl EXPORT_PID: va=0x... length=... pid=... flags=0x1
-[obmm_rw INFO] EXPORT_PID ok: mem_id=0x... tokenid=0x... uba=0x...
-  exported handle: mem_id=... tokenid=... length=... uba=... ...
-[obmm_rw INFO] ioctl IMPORT: mem_id=0x... tokenid=0x... length=... flags=0x1
-[obmm_rw INFO] IMPORT ok: local addr=0x... length=...
-  imported va = 0x...
-  [PASS] 1 KB pattern matches via imported VA
-  [bench] 1000 loopback loads: ... ns total, ... ns/load (acc=..., prevents DCE)
+[1] /dev/obmm -> fd_ctl=3
+[2] EXPORT ok: mem_id=1 (0x1)  tokenid=0x4a9  uba=0xffffffc00000
+[3] opening /dev/obmm_shmdev1 ...
+    exists: mode=0600, rdev=...
+    opened -> fd_data=4
+[4.0] mmap offset=0 (normal pages) ... OK, va=0x...
+    using variant #0
+[5] load/store test ...
+    [PASS] 1 KB pattern roundtrip OK
+[6] micro-bench: 100000 loads in X.XX us = Y.YY ns/load (sink=..., dce-guard)
+[7] UNEXPORT ok
 
-  === smoke test PASSED ===
+=== smoke test PASSED ===
 ```
 
-### What can go wrong at this stage
+### What can go wrong — reading the diagnostic output
 
-Likely failure points on the first run and how to read them:
+The test prints the result of every stage, so failures are localized:
 
 | Symptom | Meaning | Next step |
 |---|---|---|
-| `open(/dev/obmm): Permission denied` | need root or an ACL group | run with sudo |
-| `open(/dev/obmm): No such file or directory` | `obmm` kernel module not loaded | `lsmod \| grep obmm`, then `modprobe obmm` via ub-pkg-mem init |
-| `EXPORT_PID failed: Invalid argument (EINVAL)` | one of our struct fields doesn't match what the kernel expects | try non-zero `pxm_numa`, or try `OBMM_CMD_EXPORT` (size[]-based) instead of `EXPORT_PID` |
-| `IMPORT failed: EPERM` | tokenid / EID check — try matching seid to something real | borrow our local EID from URMA (see scheme5) and feed both ends |
-| `IMPORT returned addr=0` | kernel accepted the call but didn't map — flag missing | make sure `OBMM_EXPORT_FLAG_ALLOW_MMAP` was set at export time |
-| `[FAIL] N mismatches` | ioctl succeeded but read data is wrong — map went to different pages | we're on the wrong path; possibly the addr field is input (hint) not output |
+| `open(/dev/obmm): Permission denied` | need root | run with `sudo` |
+| `open(/dev/obmm): No such file or directory` | kernel module not loaded | `lsmod \| grep obmm`; `modprobe obmm` |
+| `EXPORT: ENOMEM` | pool exhausted | check `/sys/module/obmm/parameters/mempool_size` |
+| `EXPORT: EINVAL` | struct mismatch (rare) | compare installed `<ub/obmm.h>` vs the one in this source tree |
+| `stat /dev/obmm_shmdev<id>: ENOENT` | device not auto-created despite EXPORT success | check dmesg; kernel may be missing the udev rule or running a stripped build |
+| `open shmdev: EACCES` | wrong ownership / mode | `ls -l /dev/obmm_shmdev*`; ensure root or add udev rule |
+| `mmap offset=0: EINVAL`, then HUGETLB_PMD also EINVAL | neither page size accepted | dmesg will tell us why; could be NUMA mismatch or cacheable bit |
+| `[FAIL] N pattern mismatches` | mapping worked but wrote to different pages | almost impossible in loopback; means shmdev mmap backed something stale |
 
 All of these are debuggable because the kernel source is open
-(openEuler kernel, likely at `drivers/ub/mem/`).
+(openEuler, `drivers/ub/mem/obmm/` for the ub-pkg-mem build).
 
-### Cross-node test (after smoke test passes)
+### After the smoke test passes
 
-```bash
-# Node1
-./server
+1. **Cross-node server/client** — add `server.c` that allocates,
+   exports, then sends `{mem_id, tokenid, uba, scna, dcna, length}`
+   over TCP. Add `client.c` that receives that handle, fills an
+   `obmm_cmd_import.desc`, calls `OBMM_CMD_IMPORT` to get a local
+   `mem_id`, then opens `/dev/obmm_shmdev<local_mem_id>` and mmaps.
+2. **Benchmark** — same 3 bench loops as `scheme5_urma_rw`: single-
+   read, batch-read, and full Engram prefetch. Compare against the
+   0.14 ms / 128-token scheme 5 baseline.
+3. **SGLang integration** — if the numbers justify it, wire into
+   `engram_prefetcher.py` via ctypes, same shape as scheme 5.
 
-# Node2
-./client <node1-ip> <port>
+## Design notes
+
+### Why no `obmm_rw.c` abstraction layer
+
+Because the raw call sequence is already so short (5 syscalls:
+`open`, `ioctl`, `open`, `mmap`, `munmap`) that wrapping it in a
+library adds noise without saving lines. For cross-node, we'll
+add a 30-line helper for the TCP handshake and let the server /
+client use the same raw syscalls directly.
+
+### Why we still require 4 MB alignment
+
+Kernel param `/sys/module/obmm/parameters/mem_allocator_granu` is
+`2M`, but ubs-mem's SDK enforces 4 MB and empirically 4 MB works
+reliably. Rather than hit an unknown edge case, we keep 4 MB.
+
+### Why no linking against `libobmm.so.1`
+
+Even though ubs-mem's SDK dlopens this for one function
+(`obmm_set_ownership`), we don't need it in scheme 7. Our use case
+is "open wide, read/write freely, then unexport" — no dynamic
+permission switching. Zero `dlopen`, zero `ldconfig` headaches.
+
+Verify with `ldd ./smoke_test`:
+
+```
+$ ldd smoke_test
+    linux-vdso.so.1 (0x...)
+    libc.so.6 => /lib64/libc.so.6 (0x...)
+    /lib64/ld-linux-aarch64.so.1 (0x...)
 ```
 
-(commands will be added with server.c / client.c)
+Nothing from `libubsm_*`, `libubse*`, or `libobmm*` should appear.
 
-## Design notes / non-obvious choices
+## Relationship to other schemes
 
-### Why `OBMM_CMD_EXPORT_PID` and not `OBMM_CMD_EXPORT`
-
-`EXPORT_PID` takes `(va, length, pid, flags)` — simple and matches
-our "I have a buffer, make it cross-node visible" use case.
-
-`EXPORT` takes `(size[OBMM_MAX_LOCAL_NUMA_NODES], length, flags, uba, tokenid)` —
-it seems to describe a per-NUMA allocation request rather than
-exporting an existing VA. More verbose, meant for cases where you
-want the kernel to choose NUMA placement.
-
-For Engram, we already have a buffer (filled with embedding data)
-and we want that buffer made cross-node. `EXPORT_PID` fits.
-
-### Why we preserve the 4 MB alignment rule from scheme 6
-
-The `"size does not align with 4194304"` error we hit in scheme 6
-came from inside `libubsm_sdk.so`, but the alignment constraint is
-almost certainly enforced by the underlying obmm kernel module
-(it controls physical page registration). We keep the rule here
-to avoid rediscovering it the hard way.
-
-### Why seid/deid/scna/dcna start as zero
-
-For the loopback smoke test we just need the simplest possible
-call. If the kernel rejects zero EIDs with EINVAL we'll iterate:
-
-- borrow the local EID from URMA (one extra open+close on `/dev/uburma/udma2`)
-- or parse it from sysfs if exposed
-- or use PID-based addressing exclusively when both sides are the same process
-
-The important thing is that we have a clean `obmm_rw_ctx` that we
-can extend without touching callers.
-
-### Why we don't link libubsm_sdk.so
-
-That's the whole point of scheme 7. The only headers we include are:
-
-- standard libc (stdio, stdlib, unistd, sys/ioctl, sys/mman)
-- `<ub/obmm.h>` — GPL kernel UAPI
-
-If any of the other `/usr/local/ubs_mem/` files (the SDK headers,
-libubsm_sdk.so binary, ubsmd daemon) accidentally get pulled in,
-we've failed to isolate. Check with `ldd ./smoke_test` — should
-not show any libubsm_* entries.
+| Scheme | Userland deps | Kernel path | Status |
+|---|---|---|---|
+| 5 (urma_read) | `liburma.so` | URMA verbs | **working**, 0.14 ms/128 tokens |
+| 6 (libubsm_sdk) | `libubsm_sdk.so` + `libubse.so` + `ubsmd` | obmm via UBSE | abandoned (4 MB alignment was the actual blocker, not the SDK) |
+| **7 (obmm direct)** | **none** | obmm direct ioctl + shmdev mmap | **smoke test pending** |
+| Stretch: URMA_SEG_MAPPED | `liburma.so` + kernel patch | hns3 driver patch | deferred (2-3 weeks work) |

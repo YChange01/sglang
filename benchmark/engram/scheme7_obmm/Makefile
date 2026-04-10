@@ -1,65 +1,49 @@
-# Scheme 7 — direct obmm UAPI (no libubsm_sdk.so)
+# Scheme 7 — direct obmm UAPI (no libubsm_sdk.so, no libubse.so, no ubsmd)
 #
 # Targets:
-#   make             — build smoke_test, server, client (as they land)
-#   make smoke_test  — single-node loopback sanity check
-#   make clean
+#   make             — build smoke_test
+#   make smoke_test  — single-node loopback load/store test
+#   make clean       — remove binaries
 #
-# Prereqs (on Node1/Node2):
-#   - /dev/obmm exists (provided by the obmm kernel module from ub-pkg-mem)
-#   - /usr/include/ub/obmm.h present (installed with the kernel headers
-#     package — GPL-2.0+ UAPI header, 186 lines)
-#   - Read/write access to /dev/obmm (usually root, or a group with
-#     appropriate ACL)
+# Prereqs on Node1/Node2:
+#   - /dev/obmm + obmm kernel module loaded (from ub-pkg-mem)
+#   - /usr/include/ub/obmm.h present (from kernel-headers or ub-pkg-mem devel)
+#   - Root or RW on /dev/obmm and /dev/obmm_shmdev*
 #
-# We deliberately do NOT link against libubsm_sdk.so — the entire point
-# of scheme 7 is to bypass the closed userspace SDK.
+# The smoke test is fully self-contained: single C file, no custom libs,
+# just raw ioctl + mmap. If this passes, scheme7 is unblocked and we can
+# build cross-node server/client on top of the same call chain.
 
 CC      ?= cc
-CFLAGS  ?= -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE -fPIC
+CFLAGS  ?= -Wall -Wextra -O2 -g -std=c11 -D_GNU_SOURCE
 CPPFLAGS = -I/usr/include -I.
 LDFLAGS  =
 
-LIB_SRCS = obmm_rw.c
-LIB_OBJS = $(LIB_SRCS:.c=.o)
-
-BINS = smoke_test smoke_multi smoke_export
+BINS = smoke_test
 
 .PHONY: all clean help
 
 all: $(BINS)
 	@echo
 	@echo "Built: $(BINS)"
-	@echo "Next:  sudo ./smoke_export      # probe mmap offset convention (RUN THIS FIRST)"
-	@echo "       sudo ./smoke_multi       # 11-variant sanity check"
-	@echo "       sudo ./smoke_test        # end-to-end single-path test"
+	@echo "Next:  sudo ./smoke_test       # single-node loopback test"
+	@echo "       sudo ./smoke_test 16    # try a larger alloc (16 MB)"
 
-smoke_test: smoke_test.c $(LIB_OBJS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_test.c $(LIB_OBJS) $(LDFLAGS)
+smoke_test: smoke_test.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_test.c $(LDFLAGS)
 	@echo "Built $@"
-
-smoke_multi: smoke_multi.c $(LIB_OBJS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_multi.c $(LIB_OBJS) $(LDFLAGS)
-	@echo "Built $@"
-
-smoke_export: smoke_export.c $(LIB_OBJS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -o $@ smoke_export.c $(LIB_OBJS) $(LDFLAGS)
-	@echo "Built $@"
-
-%.o: %.c obmm_rw.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 clean:
 	rm -f $(BINS) *.o
 
 help:
-	@echo "Scheme 7 obmm direct UAPI"
+	@echo "Scheme 7 — direct obmm UAPI"
 	@echo ""
 	@echo "Targets:"
-	@echo "  make            build all"
-	@echo "  make smoke_test single-node loopback sanity check"
-	@echo "  make clean      remove binaries and objects"
+	@echo "  make            build smoke_test"
+	@echo "  make smoke_test rebuild just the smoke test"
+	@echo "  make clean      remove binaries"
 	@echo ""
 	@echo "First run:"
 	@echo "  make clean && make"
-	@echo "  sudo ./smoke_test       # /dev/obmm usually needs root"
+	@echo "  sudo ./smoke_test"
