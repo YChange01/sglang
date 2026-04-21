@@ -28,6 +28,20 @@ def register_attention_backend(name):
     return decorator
 
 
+@register_attention_backend("turboquant")
+def create_turboquant_backend(runner):
+    """TurboQuant paper-faithful KV quantization (arXiv:2504.19874).
+
+    Requires a TurboQuantMHAPool; pool construction is conditionally
+    selected in model_runner_kv_cache_mixin when attention_backend is
+    "turboquant". MVP is enforce-eager only.
+    """
+    from sglang.srt.layers.attention.turboquant_backend import (
+        TurboQuantAttnBackend,
+    )
+    return TurboQuantAttnBackend(runner)
+
+
 @register_attention_backend("flashinfer")
 def create_flashinfer_backend(runner):
     import torch

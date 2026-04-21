@@ -133,6 +133,7 @@ ATTENTION_BACKEND_CHOICES = [
     "torch_native",
     "flex_attention",
     "nsa",
+    "turboquant",  # paper-faithful KV quantization (arXiv:2504.19874)
     # NVIDIA specific
     "cutlass_mla",
     "fa3",
