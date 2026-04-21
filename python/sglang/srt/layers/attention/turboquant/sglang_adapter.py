@@ -30,11 +30,17 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from .attend_split_tc import turboquant_paged_attention_split_tc
 from .attend_tc import turboquant_paged_attention_tc
-from .store import turboquant_store_kv, turboquant_store_v
+from .store import (
+    turboquant_store_kv,
+    turboquant_store_split,
+    turboquant_store_v,
+)
 
 if TYPE_CHECKING:
     from .codebook import QuantState
+    from .outlier import SplitQuantState
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +171,98 @@ def sglang_paged_attention_tc(
         cache_k_rnorm=_as_paged(cache_k_rnorm),
         cache_v_qjl_sign=_as_paged(cache_v_qjl_sign),
         cache_v_rnorm=_as_paged(cache_v_rnorm),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Split-mode store + attend (paper §4.3: outlier channel splitting)
+# ---------------------------------------------------------------------------
+def sglang_store_split(
+    new_x: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    state_split: "SplitQuantState",
+    # Outlier slice buffers (flat SGLang layout)
+    cache_idx_out: torch.Tensor,
+    cache_norm_out: torch.Tensor,
+    cache_qjl_sign_out: Optional[torch.Tensor],
+    cache_rnorm_out: Optional[torch.Tensor],
+    # Regular slice buffers
+    cache_idx_reg: torch.Tensor,
+    cache_norm_reg: torch.Tensor,
+    cache_qjl_sign_reg: Optional[torch.Tensor],
+    cache_rnorm_reg: Optional[torch.Tensor],
+) -> None:
+    """Write split-quantized K or V into the SGLang flat pool."""
+    turboquant_store_split(
+        new_x=new_x,
+        state_split=state_split,
+        cache_idx_out=_as_paged(cache_idx_out),
+        cache_norm_out=_as_paged(cache_norm_out),
+        cache_qjl_sign_out=_as_paged(cache_qjl_sign_out),
+        cache_rnorm_out=_as_paged(cache_rnorm_out),
+        cache_idx_reg=_as_paged(cache_idx_reg),
+        cache_norm_reg=_as_paged(cache_norm_reg),
+        cache_qjl_sign_reg=_as_paged(cache_qjl_sign_reg),
+        cache_rnorm_reg=_as_paged(cache_rnorm_reg),
+        slot_mapping=out_cache_loc,
+        block_size=1,
+    )
+
+
+def sglang_paged_attention_split_tc(
+    q: torch.Tensor,
+    # Outlier buffers (K + V, flat SGLang layout)
+    cache_k_idx_out: torch.Tensor,
+    cache_k_norm_out: torch.Tensor,
+    cache_v_idx_out: torch.Tensor,
+    cache_v_norm_out: torch.Tensor,
+    cache_k_qjl_sign_out: Optional[torch.Tensor],
+    cache_k_rnorm_out: Optional[torch.Tensor],
+    cache_v_qjl_sign_out: Optional[torch.Tensor],
+    cache_v_rnorm_out: Optional[torch.Tensor],
+    # Regular buffers (K + V)
+    cache_k_idx_reg: torch.Tensor,
+    cache_k_norm_reg: torch.Tensor,
+    cache_v_idx_reg: torch.Tensor,
+    cache_v_norm_reg: torch.Tensor,
+    cache_k_qjl_sign_reg: Optional[torch.Tensor],
+    cache_k_rnorm_reg: Optional[torch.Tensor],
+    cache_v_qjl_sign_reg: Optional[torch.Tensor],
+    cache_v_rnorm_reg: Optional[torch.Tensor],
+    # SGLang-style metadata
+    req_to_token: torch.Tensor,
+    req_pool_indices: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    state_k: "SplitQuantState",
+    state_v: "SplitQuantState",
+) -> torch.Tensor:
+    """TurboQuant split-mode paged attention against SGLang's flat pool."""
+    block_table = req_to_token[req_pool_indices]
+
+    return turboquant_paged_attention_split_tc(
+        q=q,
+        cache_k_idx_out=_as_paged(cache_k_idx_out),
+        cache_k_norm_out=_as_paged(cache_k_norm_out),
+        cache_v_idx_out=_as_paged(cache_v_idx_out),
+        cache_v_norm_out=_as_paged(cache_v_norm_out),
+        cache_k_qjl_sign_out=_as_paged(cache_k_qjl_sign_out),
+        cache_k_rnorm_out=_as_paged(cache_k_rnorm_out),
+        cache_v_qjl_sign_out=_as_paged(cache_v_qjl_sign_out),
+        cache_v_rnorm_out=_as_paged(cache_v_rnorm_out),
+        cache_k_idx_reg=_as_paged(cache_k_idx_reg),
+        cache_k_norm_reg=_as_paged(cache_k_norm_reg),
+        cache_v_idx_reg=_as_paged(cache_v_idx_reg),
+        cache_v_norm_reg=_as_paged(cache_v_norm_reg),
+        cache_k_qjl_sign_reg=_as_paged(cache_k_qjl_sign_reg),
+        cache_k_rnorm_reg=_as_paged(cache_k_rnorm_reg),
+        cache_v_qjl_sign_reg=_as_paged(cache_v_qjl_sign_reg),
+        cache_v_rnorm_reg=_as_paged(cache_v_rnorm_reg),
+        block_table=block_table,
+        seq_lens=seq_lens,
+        query_start_loc=query_start_loc,
+        state_k=state_k,
+        state_v=state_v,
     )
 
 

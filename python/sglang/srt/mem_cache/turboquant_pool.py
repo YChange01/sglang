@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.layers.attention.turboquant import TurboQuantConfig
+from sglang.srt.layers.attention.turboquant import OutlierMask, TurboQuantConfig
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
 
 if TYPE_CHECKING:
@@ -77,23 +77,31 @@ class TurboQuantMHAPool(MHATokenToKVPool):
         turboquant_config: TurboQuantConfig,
         **kwargs,
     ) -> None:
-        # Validate config up front; reject split mode (Day 5) for MVP.
         turboquant_config.validate()
-        if turboquant_config.is_split:
-            raise NotImplementedError(
-                "TurboQuantMHAPool split-mode support lands in Day 5; "
-                "use homog (empty outlier_mask_path) for MVP."
-            )
         self._tq_cfg = turboquant_config
 
+        # Split mode: load the outlier mask file once so we know the
+        # per-slice channel counts before allocating buffers.
+        self._outlier_mask: Optional[OutlierMask] = None
+        if turboquant_config.is_split:
+            self._outlier_mask = OutlierMask.load(
+                turboquant_config.outlier_mask_path
+            )
+
         super().__init__(*args, **kwargs)
-        # head_num / head_dim set by parent; now allocate quant buffers.
         self._create_quant_buffers()
 
     # ------------------------------------------------------------------
     # Buffer allocation
     # ------------------------------------------------------------------
     def _create_quant_buffers(self) -> None:
+        cfg = self._tq_cfg
+        if cfg.is_split:
+            self._create_split_buffers()
+        else:
+            self._create_homog_buffers()
+
+    def _create_homog_buffers(self) -> None:
         cfg = self._tq_cfg
         num_slots = self.size + self.page_size
         H_kv = self.head_num
@@ -147,22 +155,141 @@ class TurboQuantMHAPool(MHATokenToKVPool):
             self._tq_k_rnorm = []
             self._tq_v_rnorm = []
 
+    def _create_split_buffers(self) -> None:
+        """Split mode: 8 buffers per (K side, V side) = 16 per layer.
+
+        Outlier slice (d_out channels, bits_outlier):
+          idx / norm / qjl_sign / rnorm
+        Regular slice (d_reg channels, bits_regular): same.
+        K and V each get their own pair.
+        """
+        cfg = self._tq_cfg
+        assert self._outlier_mask is not None
+        num_slots = self.size + self.page_size
+        H_kv = self.head_num
+        d = self.head_dim
+        d_out = self._outlier_mask.num_outliers
+        d_reg = d - d_out
+        device = self.device
+        norm_dtype = _NORM_TORCH_DTYPE[cfg.norm_dtype]
+        rnorm_dtype = _RNORM_TORCH_DTYPE[cfg.rnorm_dtype]
+
+        main_out = cfg.bits_outlier - 1 if cfg.algo == "prod" else cfg.bits_outlier
+        main_reg = cfg.bits_regular - 1 if cfg.algo == "prod" else cfg.bits_regular
+        pack_out = _pow2_ceil(main_out)
+        pack_reg = _pow2_ceil(main_reg)
+
+        if (d_out * pack_out) % 8 != 0:
+            raise ValueError(
+                f"d_out={d_out} * pack_bits={pack_out} must be byte-aligned"
+            )
+        if (d_reg * pack_reg) % 8 != 0:
+            raise ValueError(
+                f"d_reg={d_reg} * pack_bits={pack_reg} must be byte-aligned"
+            )
+        if cfg.algo == "prod" and (d_out % 8 != 0 or d_reg % 8 != 0):
+            raise ValueError(
+                f"Both d_out={d_out} and d_reg={d_reg} must be "
+                "divisible by 8 for QJL bit-pack"
+            )
+
+        idx_last_out = d_out * pack_out // 8
+        idx_last_reg = d_reg * pack_reg // 8
+
+        def _u8(shape):
+            return torch.zeros(shape, dtype=torch.uint8, device=device)
+
+        def _norm(shape):
+            return torch.zeros(shape, dtype=norm_dtype, device=device)
+
+        def _rnorm(shape):
+            return torch.zeros(shape, dtype=rnorm_dtype, device=device)
+
+        shape_idx_out = (num_slots, H_kv, idx_last_out)
+        shape_idx_reg = (num_slots, H_kv, idx_last_reg)
+        shape_meta = (num_slots, H_kv)
+        shape_qjl_out = (num_slots, H_kv, d_out // 8)
+        shape_qjl_reg = (num_slots, H_kv, d_reg // 8)
+
+        L = self.layer_num
+        is_prod = cfg.algo == "prod"
+
+        # K side
+        self._tq_k_idx_out = [_u8(shape_idx_out) for _ in range(L)]
+        self._tq_k_idx_reg = [_u8(shape_idx_reg) for _ in range(L)]
+        self._tq_k_norm_out = [_norm(shape_meta) for _ in range(L)]
+        self._tq_k_norm_reg = [_norm(shape_meta) for _ in range(L)]
+        self._tq_k_qjl_sign_out = (
+            [_u8(shape_qjl_out) for _ in range(L)] if is_prod else []
+        )
+        self._tq_k_qjl_sign_reg = (
+            [_u8(shape_qjl_reg) for _ in range(L)] if is_prod else []
+        )
+        self._tq_k_rnorm_out = (
+            [_rnorm(shape_meta) for _ in range(L)] if is_prod else []
+        )
+        self._tq_k_rnorm_reg = (
+            [_rnorm(shape_meta) for _ in range(L)] if is_prod else []
+        )
+        # V side mirrors K
+        self._tq_v_idx_out = [_u8(shape_idx_out) for _ in range(L)]
+        self._tq_v_idx_reg = [_u8(shape_idx_reg) for _ in range(L)]
+        self._tq_v_norm_out = [_norm(shape_meta) for _ in range(L)]
+        self._tq_v_norm_reg = [_norm(shape_meta) for _ in range(L)]
+        self._tq_v_qjl_sign_out = (
+            [_u8(shape_qjl_out) for _ in range(L)] if is_prod else []
+        )
+        self._tq_v_qjl_sign_reg = (
+            [_u8(shape_qjl_reg) for _ in range(L)] if is_prod else []
+        )
+        self._tq_v_rnorm_out = (
+            [_rnorm(shape_meta) for _ in range(L)] if is_prod else []
+        )
+        self._tq_v_rnorm_reg = (
+            [_rnorm(shape_meta) for _ in range(L)] if is_prod else []
+        )
+
     # ------------------------------------------------------------------
     # Accessors for the attention backend
     # ------------------------------------------------------------------
     def get_quant_buffers(self, layer_id: int) -> dict[str, Optional[torch.Tensor]]:
         """Return the per-layer TurboQuant buffers as a dict.
 
-        Keys always present: cache_k_idx, cache_k_norm, cache_v_idx,
-        cache_v_norm. For Q_prod also: cache_k_qjl_sign, cache_k_rnorm,
-        cache_v_qjl_sign, cache_v_rnorm. In tight-pack mode the qjl
-        fields are None (signs live in the top bit of the idx nibble).
+        Homog mode: cache_k_idx, cache_k_norm, cache_v_idx, cache_v_norm
+            (+ cache_k_qjl_sign, cache_k_rnorm, cache_v_qjl_sign,
+            cache_v_rnorm for Q_prod; qjl_sign fields are None in
+            tight-pack mode).
+
+        Split mode: 16 keys with _out / _reg suffix for each slice.
         """
         i = layer_id - self.start_layer
 
         def _maybe(tensors: list[torch.Tensor]) -> Optional[torch.Tensor]:
             return tensors[i] if tensors else None
 
+        if self._tq_cfg.is_split:
+            return {
+                # K outlier
+                "cache_k_idx_out":      self._tq_k_idx_out[i],
+                "cache_k_norm_out":     self._tq_k_norm_out[i],
+                "cache_k_qjl_sign_out": _maybe(self._tq_k_qjl_sign_out),
+                "cache_k_rnorm_out":    _maybe(self._tq_k_rnorm_out),
+                # K regular
+                "cache_k_idx_reg":      self._tq_k_idx_reg[i],
+                "cache_k_norm_reg":     self._tq_k_norm_reg[i],
+                "cache_k_qjl_sign_reg": _maybe(self._tq_k_qjl_sign_reg),
+                "cache_k_rnorm_reg":    _maybe(self._tq_k_rnorm_reg),
+                # V outlier
+                "cache_v_idx_out":      self._tq_v_idx_out[i],
+                "cache_v_norm_out":     self._tq_v_norm_out[i],
+                "cache_v_qjl_sign_out": _maybe(self._tq_v_qjl_sign_out),
+                "cache_v_rnorm_out":    _maybe(self._tq_v_rnorm_out),
+                # V regular
+                "cache_v_idx_reg":      self._tq_v_idx_reg[i],
+                "cache_v_norm_reg":     self._tq_v_norm_reg[i],
+                "cache_v_qjl_sign_reg": _maybe(self._tq_v_qjl_sign_reg),
+                "cache_v_rnorm_reg":    _maybe(self._tq_v_rnorm_reg),
+            }
         return {
             "cache_k_idx":      self._tq_k_idx[i],
             "cache_k_norm":     self._tq_k_norm[i],
@@ -177,6 +304,10 @@ class TurboQuantMHAPool(MHATokenToKVPool):
     @property
     def turboquant_config(self) -> TurboQuantConfig:
         return self._tq_cfg
+
+    @property
+    def outlier_mask(self) -> Optional[OutlierMask]:
+        return self._outlier_mask
 
     # ------------------------------------------------------------------
     # KV write (Day 3-4 wires in real store; MVP falls through to bf16)
@@ -207,12 +338,25 @@ class TurboQuantMHAPool(MHATokenToKVPool):
         # Report bf16 + quant bytes so logs reflect actual GPU footprint.
         k_bytes, v_bytes = super().get_kv_size_bytes()
         extra = 0
-        for lst in (
-            self._tq_k_idx, self._tq_v_idx,
-            self._tq_k_norm, self._tq_v_norm,
-            self._tq_k_qjl_sign, self._tq_v_qjl_sign,
-            self._tq_k_rnorm, self._tq_v_rnorm,
-        ):
+        if self._tq_cfg.is_split:
+            buf_lists = (
+                self._tq_k_idx_out, self._tq_k_idx_reg,
+                self._tq_k_norm_out, self._tq_k_norm_reg,
+                self._tq_k_qjl_sign_out, self._tq_k_qjl_sign_reg,
+                self._tq_k_rnorm_out, self._tq_k_rnorm_reg,
+                self._tq_v_idx_out, self._tq_v_idx_reg,
+                self._tq_v_norm_out, self._tq_v_norm_reg,
+                self._tq_v_qjl_sign_out, self._tq_v_qjl_sign_reg,
+                self._tq_v_rnorm_out, self._tq_v_rnorm_reg,
+            )
+        else:
+            buf_lists = (
+                self._tq_k_idx, self._tq_v_idx,
+                self._tq_k_norm, self._tq_v_norm,
+                self._tq_k_qjl_sign, self._tq_v_qjl_sign,
+                self._tq_k_rnorm, self._tq_v_rnorm,
+            )
+        for lst in buf_lists:
             for t in lst:
                 extra += t.numel() * t.element_size()
         # Split roughly between k and v (they're symmetric).

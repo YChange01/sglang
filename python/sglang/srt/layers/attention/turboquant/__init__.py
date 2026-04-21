@@ -16,8 +16,10 @@ from .config import TurboQuantConfig
 from .outlier import OutlierMask, SplitQuantState
 from .sglang_adapter import (
     build_query_start_loc,
+    sglang_paged_attention_split_tc,
     sglang_paged_attention_tc,
     sglang_store_kv,
+    sglang_store_split,
     sglang_store_v,
 )
 from .stages import (
@@ -45,6 +47,8 @@ __all__ = [
     # SGLang attention adapter
     "sglang_store_kv",
     "sglang_store_v",
+    "sglang_store_split",
     "sglang_paged_attention_tc",
+    "sglang_paged_attention_split_tc",
     "build_query_start_loc",
 ]
