@@ -14,6 +14,12 @@ from __future__ import annotations
 from .codebook import QuantState
 from .config import TurboQuantConfig
 from .outlier import OutlierMask, SplitQuantState
+from .sglang_adapter import (
+    build_query_start_loc,
+    sglang_paged_attention_tc,
+    sglang_store_kv,
+    sglang_store_v,
+)
 from .stages import (
     DEPRECATED_ALIASES,
     SILENT_ALIASES,
@@ -36,4 +42,9 @@ __all__ = [
     "resolve_stage",
     "list_stage_names",
     "all_stage_names_including_aliases",
+    # SGLang attention adapter
+    "sglang_store_kv",
+    "sglang_store_v",
+    "sglang_paged_attention_tc",
+    "build_query_start_loc",
 ]
