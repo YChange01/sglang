@@ -323,16 +323,11 @@ class TurboQuantMHAPool(MHATokenToKVPool):
         layer_id_override: Optional[int] = None,
     ) -> None:
         # Preserve the standard bf16 path so radix cache / disagg /
-        # cpu offload keep working during MVP.
-        super().set_kv_buffer(
-            layer, loc, cache_k, cache_v,
-            k_scale=k_scale, v_scale=v_scale,
-            layer_id_override=layer_id_override,
-        )
-        # TODO(Day 3-4): turboquant_store_kv(...) writes quant buffers.
-        # Shape: cache_k is (num_tokens, H_kv*head_dim); loc is
-        # 1-D absolute slot indices. Stays no-op until store.py is
-        # ported from vllm_fork/vllm/turboquant/store.py.
+        # cpu offload keep working during MVP. Quant buffers are written
+        # by TurboQuantAttnBackend._forward_core (which calls the
+        # sglang_store_kv / _v / _split kernels directly using
+        # self.get_quant_buffers(layer_id)). The bf16 path here is
+        # cheap (one tensor copy) and removed in a later phase.
 
     def get_kv_size_bytes(self):
         # Report bf16 + quant bytes so logs reflect actual GPU footprint.
