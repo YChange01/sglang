@@ -149,6 +149,49 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
                        const uint32_t* lens,
                        uint32_t count);
 
+/**
+ * Write `len` bytes from local offset `local_offset` into remote offset
+ * `remote_offset`, then wait for the local send completion.
+ *
+ * This is the conservative WRITE path. It includes post + CQ poll overhead and
+ * is useful for validating completion behavior. For latency ping-pong use
+ * urma_rw_write_post() to match posted-write puncture measurements.
+ */
+int urma_rw_write(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                  uint64_t remote_offset, uint32_t len);
+
+/**
+ * Posted WRITE fast path: write `len` bytes from local offset `local_offset`
+ * into remote offset `remote_offset` and return after posting the WR.
+ *
+ * No completion is requested or polled. Caller must provide an application-level
+ * visibility check, e.g. the peer polling a sequence number and writing a
+ * response. Single-thread only, one outstanding logical ping-pong at a time.
+ */
+int urma_rw_write_post(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                       uint64_t remote_offset, uint32_t len);
+
+/**
+ * Fast-path single read — minimal-overhead variant of urma_rw_read.
+ *
+ * Trade-offs vs urma_rw_read:
+ *   - No bounds checks, no atomic rid, no per-call WR/SGE stack construction,
+ *     no rid correlation in poll. ~100-150ns faster on aarch64.
+ *   - Single-thread only. Exactly one outstanding operation per ctx at a time.
+ *   - Caller is responsible for offset/len validity.
+ *
+ * Use this for the hot path when profiling shows urma_rw_read's per-call
+ * overhead matters (Engram batch=1 scenarios, synchronous read-modify-write).
+ *
+ * @param ctx            URMA context (connected client)
+ * @param local_offset   Offset within local buffer to write into
+ * @param remote_offset  Offset within remote buffer to read from
+ * @param len            Number of bytes to read
+ * @return 0 on success, negative error code on failure
+ */
+int urma_rw_read_fast(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                      uint64_t remote_offset, uint32_t len);
+
 #ifdef __cplusplus
 }
 #endif

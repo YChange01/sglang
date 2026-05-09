@@ -141,8 +141,10 @@ typedef struct {
 static void *urma_thread(void *arg)
 {
     urma_args_t *a = (urma_args_t *)arg;
+    const char *dev_name = getenv("URMA_DEV");
 
-    urma_rw_ctx_t *ctx = urma_rw_init(NULL, a->data_size);
+    printf("[URMA] Device: %s\n", dev_name ? dev_name : "(auto)");
+    urma_rw_ctx_t *ctx = urma_rw_init(dev_name, a->data_size);
     if (!ctx) {
         fprintf(stderr, "[URMA] urma_rw_init failed\n");
         return NULL;
@@ -254,7 +256,59 @@ int main(int argc, char *argv[])
         }
     }
 
-    /* Step 5: Fill data (both CACHE and NONCACHE) */
+    char shm_name_import_nc[MAX_SHM_NAME_LENGTH + 1];
+    snprintf(shm_name_import_nc, sizeof(shm_name_import_nc),
+             "%s_import_nc", shm_name);
+    ubsmem_shmem_deallocate(shm_name_import_nc);
+
+    void *ptr_import_nc = NULL;
+    ret = ubsmem_shmem_allocate(region_name, shm_name_import_nc, buf_size,
+                                0666,
+                                UBSM_FLAG_ONLY_IMPORT_NONCACHE |
+                                UBSM_FLAG_MEM_ANONYMOUS);
+    if (ret != 0) {
+        printf("[4/5] shmem_allocate(%s, IMPORT_NONCACHE) failed: %d (non-fatal)\n",
+               shm_name_import_nc, ret);
+    } else {
+        ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, shm_name_import_nc, 0, &ptr_import_nc);
+        if (ret != 0 || !ptr_import_nc) {
+            printf("[4/5] shmem_map(%s) failed: %d (non-fatal)\n",
+                   shm_name_import_nc, ret);
+            ptr_import_nc = NULL;
+        } else {
+            printf("[4/5] shmem IMPORT_NONCACHE OK: %s, ptr=%p\n",
+                   shm_name_import_nc, ptr_import_nc);
+        }
+    }
+
+    char shm_name_huge[MAX_SHM_NAME_LENGTH + 1];
+    snprintf(shm_name_huge, sizeof(shm_name_huge), "%s_huge", shm_name);
+    ubsmem_shmem_deallocate(shm_name_huge);
+
+    void *ptr_huge = NULL;
+    ret = ubsmem_shmem_allocate(region_name, shm_name_huge, buf_size,
+                                0666,
+                                UBSM_FLAG_ONLY_IMPORT_NONCACHE |
+                                UBSM_FLAG_MEM_ANONYMOUS |
+                                UBSM_FLAG_MMAP_HUGETLB_PMD);
+    if (ret != 0) {
+        printf("[4/5] shmem_allocate(%s, HUGE) failed: %d (non-fatal)\n",
+               shm_name_huge, ret);
+    } else {
+        ret = ubsmem_shmem_map(NULL, buf_size, PROT_READ | PROT_WRITE,
+                               MAP_SHARED, shm_name_huge, 0, &ptr_huge);
+        if (ret != 0 || !ptr_huge) {
+            printf("[4/5] shmem_map(%s) failed: %d (non-fatal)\n",
+                   shm_name_huge, ret);
+            ptr_huge = NULL;
+        } else {
+            printf("[4/5] shmem HUGE OK: %s, ptr=%p\n",
+                   shm_name_huge, ptr_huge);
+        }
+    }
+
+    /* Step 5: Fill data in every successfully-created UBS-MEM object. */
     float *data = (float *)ptr;
     size_t num_floats = buf_size / sizeof(float);
     for (size_t i = 0; i < num_floats; i++)
@@ -264,8 +318,17 @@ int main(int argc, char *argv[])
         for (size_t i = 0; i < num_floats; i++)
             data_nc[i] = (float)i * 0.001f;
     }
-    printf("[5/5] Data filled: %zu floats%s\n", num_floats,
-           ptr_nc ? " (cache + noncache)" : " (cache only)");
+    if (ptr_import_nc) {
+        float *data_import_nc = (float *)ptr_import_nc;
+        for (size_t i = 0; i < num_floats; i++)
+            data_import_nc[i] = (float)i * 0.001f;
+    }
+    if (ptr_huge) {
+        float *data_huge = (float *)ptr_huge;
+        for (size_t i = 0; i < num_floats; i++)
+            data_huge[i] = (float)i * 0.001f;
+    }
+    printf("[5/5] Data filled: %zu floats\n", num_floats);
 
     /* Start TCP thread */
     tcp_args_t ta = { (const char *)data, buf_size, tcp_port };
@@ -282,6 +345,11 @@ int main(int argc, char *argv[])
     printf("  shmem: %s (%zu MB, cache)\n", shm_name, size_mb);
     if (ptr_nc)
         printf("  shmem: %s (%zu MB, noncache)\n", shm_name_nc, size_mb);
+    if (ptr_import_nc)
+        printf("  shmem: %s (%zu MB, import noncache)\n",
+               shm_name_import_nc, size_mb);
+    if (ptr_huge)
+        printf("  shmem: %s (%zu MB, huge)\n", shm_name_huge, size_mb);
     printf("  TCP:   :%u\n", tcp_port);
     printf("  URMA:  :%u\n\n", urma_port);
 
@@ -298,6 +366,14 @@ int main(int argc, char *argv[])
     if (ptr_nc) {
         ubsmem_shmem_unmap(ptr_nc, buf_size);
         ubsmem_shmem_deallocate(shm_name_nc);
+    }
+    if (ptr_import_nc) {
+        ubsmem_shmem_unmap(ptr_import_nc, buf_size);
+        ubsmem_shmem_deallocate(shm_name_import_nc);
+    }
+    if (ptr_huge) {
+        ubsmem_shmem_unmap(ptr_huge, buf_size);
+        ubsmem_shmem_deallocate(shm_name_huge);
     }
     ubsmem_finalize();
     printf("Done.\n");

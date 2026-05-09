@@ -59,7 +59,11 @@ AI 设计并实现了统一的 benchmark 架构：
 benchmark/engram/
 ├── lib/urma_rw.c/h         — URMA RDMA READ 库
 ├── server/server.c         — 统一 server（ubs_mem + TCP + URMA 三种服务）
-├── bench/bench_all.c       — 统一 benchmark（5 种传输模式）
+├── bench/bench_local.c     — LOCAL DRAM 完整 read benchmark
+├── bench/bench_tcp.c       — TCP 完整 read benchmark
+├── bench/bench_urma_read.c — URMA READ 完整 benchmark
+├── bench/bench_ubsmem_*.c  — UBS-MEM cache/noncache/huge 完整 benchmark
+├── bench/*_pingpong.c      — UB-M/URMA write pingpong 穿刺 benchmark
 ├── e2e/                    — Python E2E benchmark
 │   ├── engram_pool_transport.py  — 4 种后端的 Python 封装
 │   └── bench_e2e.py             — SGLang + Qwen3-8B 推理测试
@@ -227,12 +231,3 @@ O_SYNC 映射下 CPU 的 load 指令严格串行，无法利用 UBMMU 的并行�
 - AI 无法直接访问远程节点执行命令，需要人工在终端运行并回传结果
 - 硬件相关的调试（驱动加载、服务重启）需要人工操作
 - AI 对 obmm 内核模块的理解来自用户空间头文件和日志，不涉及内核源码
-
-## 8. 结论
-
-通过 AI 辅助研发，在华为 UB 平台上成功实现了跨节点 Engram 内存池化的完整方案对比。UBS-MEM cache 模式在 benchmark 条件下达到了接近本地 DRAM 的访问性能（88ns vs 79ns），比论文 CXL 方案的延迟更低（88ns vs ~200ns）。URMA 方案通过 batch 并行在大 batch 场景下表现稳健（~4.1 GB/s 吞吐）。AI 在整个研发过程中承担了方案分析、代码实现和结果解读的核心工作，显著加速了探索性研发的迭代效率。
-
----
-
-*本项目代码：https://github.com/YChange01/sglang, 分支 feat/engram-urma-pool*
-*论文参考：arXiv:2603.10087 "Pooling Engram Conditional Memory in Large Language Models using CXL"*

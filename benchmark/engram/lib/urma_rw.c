@@ -82,6 +82,18 @@ struct urma_rw_ctx {
     urma_sg_t*     batch_dst_sgs;
     urma_jfs_wr_t* batch_wrs;
 
+    /* Fast-path single-read template — pre-built once at import-remote time,
+     * fast path only patches addr/len fields. Single-thread only, no rid
+     * tracking, no atomic, no bounds check. Caller must serialize. */
+    urma_sge_t     fast_src_sge;
+    urma_sge_t     fast_dst_sge;
+    urma_jfs_wr_t  fast_wr;
+    urma_sge_t     fast_write_src_sge;
+    urma_sge_t     fast_write_dst_sge;
+    urma_jfs_wr_t  fast_write_wr;
+    uint64_t       fast_remote_va_base;  /* cached ctx->remote_tseg->seg.ubva.va */
+    uint64_t       fast_local_va_base;   /* cached (uint64_t)ctx->buf */
+
     int listen_fd;
     int client_fd;
     bool is_server;
@@ -450,6 +462,46 @@ static int import_remote(urma_rw_ctx_t* ctx, const seg_jetty_info_t* remote)
 
     LOG_INFO("Imported remote seg (va=0x%lx, len=%lu) and jetty",
              (unsigned long)remote->seg_va, (unsigned long)remote->seg_len);
+
+    /* Pre-build fast-path single-read template. Only the addr/len fields of
+     * fast_{src,dst}_sge will be patched per call; everything else is frozen. */
+    ctx->fast_remote_va_base = ctx->remote_tseg->seg.ubva.va;
+    ctx->fast_local_va_base  = (uint64_t)ctx->buf;
+
+    ctx->fast_src_sge.tseg = ctx->remote_tseg;
+    ctx->fast_dst_sge.tseg = ctx->local_tseg;
+    /* addr/len patched per call */
+
+    memset(&ctx->fast_wr, 0, sizeof(ctx->fast_wr));
+    ctx->fast_wr.opcode = URMA_OPC_READ;
+    ctx->fast_wr.flag.value = 0;
+    ctx->fast_wr.flag.bs.complete_enable = 1;
+    ctx->fast_wr.tjetty = ctx->remote_tjetty;
+    ctx->fast_wr.user_ctx = 0;
+    ctx->fast_wr.next = NULL;
+    /* num_sge must be set on the sg; sge pointer too.
+     * The rw.{src,dst} sg struct is embedded in urma_jfs_wr_t. */
+    ctx->fast_wr.rw.src.sge = &ctx->fast_src_sge;
+    ctx->fast_wr.rw.src.num_sge = 1;
+    ctx->fast_wr.rw.dst.sge = &ctx->fast_dst_sge;
+    ctx->fast_wr.rw.dst.num_sge = 1;
+
+    /* Pre-build posted-WRITE fast-path template. */
+    ctx->fast_write_src_sge.tseg = ctx->local_tseg;
+    ctx->fast_write_dst_sge.tseg = ctx->remote_tseg;
+
+    memset(&ctx->fast_write_wr, 0, sizeof(ctx->fast_write_wr));
+    ctx->fast_write_wr.opcode = URMA_OPC_WRITE;
+    ctx->fast_write_wr.flag.value = 0;
+    ctx->fast_write_wr.flag.bs.complete_enable = 0;
+    ctx->fast_write_wr.tjetty = ctx->remote_tjetty;
+    ctx->fast_write_wr.user_ctx = 0;
+    ctx->fast_write_wr.next = NULL;
+    ctx->fast_write_wr.rw.src.sge = &ctx->fast_write_src_sge;
+    ctx->fast_write_wr.rw.src.num_sge = 1;
+    ctx->fast_write_wr.rw.dst.sge = &ctx->fast_write_dst_sge;
+    ctx->fast_write_wr.rw.dst.num_sge = 1;
+
     return 0;
 }
 
@@ -761,4 +813,127 @@ int urma_rw_read_batch(urma_rw_ctx_t* ctx,
     LOG_ERR("batch completion timeout (last_rid=%lu)",
             (unsigned long)last_rid);
     return URMA_RW_ERR_POLL;
+}
+
+int urma_rw_write(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                  uint64_t remote_offset, uint32_t len)
+{
+    if (!ctx || !ctx->remote_tseg || !ctx->remote_tjetty || len == 0) {
+        return URMA_RW_ERR_PARAM;
+    }
+    if (local_offset + len > ctx->buf_size ||
+        remote_offset + len > ctx->remote_tseg->seg.len) {
+        LOG_ERR("write out of bounds: local=%lu+%u (buf=%lu), remote=%lu+%u (rseg=%lu)",
+                (unsigned long)local_offset, len, (unsigned long)ctx->buf_size,
+                (unsigned long)remote_offset, len,
+                (unsigned long)ctx->remote_tseg->seg.len);
+        return URMA_RW_ERR_PARAM;
+    }
+
+    urma_sge_t src_sge = {
+        .addr = (uint64_t)ctx->buf + local_offset,
+        .len = len,
+        .tseg = ctx->local_tseg,
+    };
+    urma_sge_t dst_sge = {
+        .addr = ctx->remote_tseg->seg.ubva.va + remote_offset,
+        .len = len,
+        .tseg = ctx->remote_tseg,
+    };
+    urma_sg_t src_sg = {.sge = &src_sge, .num_sge = 1};
+    urma_sg_t dst_sg = {.sge = &dst_sge, .num_sge = 1};
+    urma_rw_wr_t rw = {.src = src_sg, .dst = dst_sg};
+
+    uint64_t rid = __atomic_fetch_add(&ctx->rid, 1, __ATOMIC_RELAXED);
+    urma_jfs_wr_t wr = {
+        .opcode = URMA_OPC_WRITE,
+        .flag.bs.complete_enable = 1,
+        .flag.bs.inline_flag = 0,
+        .tjetty = ctx->remote_tjetty,
+        .user_ctx = rid,
+        .rw = rw,
+        .next = NULL,
+    };
+    urma_jfs_wr_t* bad_wr = NULL;
+    if (urma_post_jetty_send_wr(ctx->jetty, &wr, &bad_wr) != URMA_SUCCESS) {
+        LOG_ERR("urma_post_jetty_send_wr WRITE failed");
+        return URMA_RW_ERR_POST;
+    }
+
+    return poll_completion(ctx, rid);
+}
+
+int urma_rw_write_post(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                       uint64_t remote_offset, uint32_t len)
+{
+    if (!ctx || !ctx->remote_tseg || !ctx->remote_tjetty || len == 0) {
+        return URMA_RW_ERR_PARAM;
+    }
+    if (local_offset + len > ctx->buf_size ||
+        remote_offset + len > ctx->remote_tseg->seg.len) {
+        return URMA_RW_ERR_PARAM;
+    }
+
+    ctx->fast_write_src_sge.addr = ctx->fast_local_va_base + local_offset;
+    ctx->fast_write_src_sge.len = len;
+    ctx->fast_write_dst_sge.addr = ctx->fast_remote_va_base + remote_offset;
+    ctx->fast_write_dst_sge.len = len;
+
+    urma_jfs_wr_t* bad_wr = NULL;
+    if (urma_post_jetty_send_wr(ctx->jetty, &ctx->fast_write_wr, &bad_wr) != URMA_SUCCESS) {
+        return URMA_RW_ERR_POST;
+    }
+    return URMA_RW_OK;
+}
+
+
+/* ================================================================== */
+/*  Fast path: single read with minimal overhead                       */
+/* ================================================================== */
+
+/*
+ * Design notes (why this is faster than urma_rw_read):
+ *  - No bounds check: caller-serialized, caller-verified.
+ *  - No atomic rid: user_ctx is fixed (0) — we don't correlate CRs.
+ *  - No stack-allocated WR/SGE/SG: everything lives in ctx, we patch addr/len.
+ *  - No rid mismatch check in poll: only status is checked.
+ *  - Tight busy-poll with no per-iteration retry counter in the hot branch
+ *    (single unbounded loop; caller can kill if fabric hangs).
+ *
+ * Expected saving vs urma_rw_read: ~100-150ns per call on aarch64.
+ * Not thread-safe. Not reentrant. One outstanding op at a time.
+ */
+int urma_rw_read_fast(urma_rw_ctx_t* ctx, uint64_t local_offset,
+                      uint64_t remote_offset, uint32_t len)
+{
+    /* Patch template — single write to each field, no struct zeroing. */
+    ctx->fast_src_sge.addr = ctx->fast_remote_va_base + remote_offset;
+    ctx->fast_src_sge.len  = len;
+    ctx->fast_dst_sge.addr = ctx->fast_local_va_base + local_offset;
+    ctx->fast_dst_sge.len  = len;
+
+    urma_jfs_wr_t* bad_wr = NULL;
+    if (urma_post_jetty_send_wr(ctx->jetty, &ctx->fast_wr, &bad_wr) != URMA_SUCCESS) {
+        return URMA_RW_ERR_POST;
+    }
+
+    /* Busy-poll for exactly one CR. No rid check — single outstanding op.
+     * Keep the loop body minimal: a hot-path call to urma_poll_jfc and a
+     * single branch. The cr struct is on stack (16-32B) — negligible. */
+    urma_cr_t cr;
+    for (;;) {
+        int n = urma_poll_jfc(ctx->jfc, 1, &cr);
+        if (n > 0) {
+            if (cr.status != URMA_CR_SUCCESS) {
+                LOG_ERR("fast CR failed: status=%d", cr.status);
+                return URMA_RW_ERR_POLL;
+            }
+            return URMA_RW_OK;
+        }
+        if (n < 0) {
+            LOG_ERR("urma_poll_jfc: %d", n);
+            return URMA_RW_ERR_POLL;
+        }
+        /* n == 0: no CR yet, keep spinning. */
+    }
 }
