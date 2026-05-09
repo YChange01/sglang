@@ -62,7 +62,7 @@ Read modes:
   all
 
 Common environment:
-  NUMA_NODE             default: 0
+  NUMA_NODE             default: 0; set "none" to disable binding
   SIZE_MB               default: 128
   SHM_NAME              default: engram_test
   SERVER_IP             default: 192.168.84.245

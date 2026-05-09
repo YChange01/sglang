@@ -19,7 +19,7 @@
 #   ./run.sh urma-write client --bytes 512                       # Node2: URMA write pinger
 #
 # Environment:
-#   NUMA_NODE    — NUMA node to bind (default: 0)
+#   NUMA_NODE    — NUMA node to bind (default: 0; set "none" to disable)
 #   SIZE_MB      — shmem size in MB (default: 128)
 #   SHM_NAME     — shmem object name (default: engram_test)
 #   SERVER_IP    — server IP (default: 192.168.84.245)
@@ -42,7 +42,17 @@ URMA_PP_PORT=${URMA_PP_PORT:-13858}
 PROVIDER=${PROVIDER:-node1}
 URMA_DEV=${URMA_DEV:-}
 
-NUMA_CMD="numactl --cpunodebind=$NUMA_NODE --membind=$NUMA_NODE"
+if [ "$NUMA_NODE" = "none" ] || [ "$NUMA_NODE" = "off" ] || [ "$NUMA_NODE" = "-1" ]; then
+    NUMA_CMD=""
+    NUMA_DESC="disabled"
+elif command -v numactl >/dev/null 2>&1; then
+    NUMA_CMD="numactl --cpunodebind=$NUMA_NODE --membind=$NUMA_NODE"
+    NUMA_DESC="node $NUMA_NODE"
+else
+    NUMA_CMD=""
+    NUMA_DESC="disabled (numactl not found)"
+    echo "[WARN] numactl not found; running without NUMA binding. Install numactl or set NUMA_NODE=none to silence this." >&2
+fi
 
 read_bin_for_mode() {
     case "$1" in
@@ -83,7 +93,7 @@ case "${1:-help}" in
         echo "=== Starting Unified Server ==="
         echo "  shmem: $SHM_NAME ($SIZE_MB MB)"
         echo "  TCP: :$TCP_PORT, URMA: :$URMA_PORT"
-        echo "  NUMA: node $NUMA_NODE"
+        echo "  NUMA: $NUMA_DESC"
         echo "  URMA_DEV: ${URMA_DEV:-auto}"
         echo ""
         $NUMA_CMD ./server/server $SIZE_MB $SHM_NAME $TCP_PORT $URMA_PORT
@@ -185,7 +195,7 @@ case "${1:-help}" in
         shift 2>/dev/null || true
         echo "=== UB-MEM Noncache Write Pingpong: $ROLE ==="
         echo "  shmem base: $SHM_NAME"
-        echo "  NUMA: node $NUMA_NODE"
+        echo "  NUMA: $NUMA_DESC"
         echo ""
         $NUMA_CMD ./bench/ubsmem_nc_write_pingpong \
             --role "$ROLE" --name "$SHM_NAME" "$@"
@@ -197,7 +207,7 @@ case "${1:-help}" in
         shift 2>/dev/null || true
         echo "=== URMA WRITE Pingpong: $ROLE ==="
         echo "  server: $SERVER_IP:$URMA_PP_PORT"
-        echo "  NUMA: node $NUMA_NODE"
+        echo "  NUMA: $NUMA_DESC"
         echo "  URMA_DEV: ${URMA_DEV:-auto}"
         echo ""
         $NUMA_CMD ./bench/urma_write_pingpong \
