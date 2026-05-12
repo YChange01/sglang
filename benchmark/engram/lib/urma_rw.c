@@ -75,6 +75,7 @@ struct urma_rw_ctx {
     urma_token_t   token;
     uint64_t       rid;  /* request id counter */
     urma_tp_type_t tp_type;
+    uint8_t        priority;
 
     /* Pre-allocated batch buffers (heap, not stack — DMA-safe) */
     urma_sge_t*    batch_src_sges;
@@ -164,6 +165,40 @@ static urma_tp_type_t parse_tp_type_env(void)
     return URMA_CTP;
 }
 
+static union urma_tp_type_en tp_type_mask(urma_tp_type_t tp_type)
+{
+    union urma_tp_type_en mask = {0};
+    switch (tp_type) {
+        case URMA_RTP:
+            mask.bs.rtp = 1;
+            break;
+        case URMA_CTP:
+            mask.bs.ctp = 1;
+            break;
+        case URMA_UTP:
+            mask.bs.utp = 1;
+            break;
+        default:
+            break;
+    }
+    return mask;
+}
+
+static uint8_t select_priority_for_tp(const urma_device_attr_t* attr,
+                                      urma_tp_type_t tp_type)
+{
+    union urma_tp_type_en want = tp_type_mask(tp_type);
+    for (uint8_t pri = 0; pri <= URMA_MAX_PRIORITY; pri++) {
+        if (attr->dev_cap.priority_info[pri].tp_type.value == want.value) {
+            return pri;
+        }
+    }
+
+    LOG_ERR("No priority matches tp=%s; falling back to %u",
+            tp_type_name(tp_type), (unsigned)URMA_MAX_PRIORITY);
+    return URMA_MAX_PRIORITY;
+}
+
 urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
 {
     urma_rw_ctx_t* ctx = (urma_rw_ctx_t*)calloc(1, sizeof(urma_rw_ctx_t));
@@ -174,6 +209,7 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
     ctx->listen_fd = -1;
     ctx->client_fd = -1;
     ctx->tp_type = parse_tp_type_env();
+    ctx->priority = URMA_MAX_PRIORITY;
 
     if (do_urma_init() != 0) goto FREE_CTX;
 
@@ -233,6 +269,7 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
         LOG_ERR("urma_query_device failed");
         goto DEL_JFCE;
     }
+    ctx->priority = select_priority_for_tp(&dev_attr, ctx->tp_type);
     urma_jfc_cfg_t jfc_cfg = {
         .depth = dev_attr.dev_cap.max_jfc_depth,
         .flag = {.value = 0},
@@ -269,7 +306,7 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
         .flag.bs.order_type = 0,
         .flag.bs.multi_path = 0,
         .trans_mode = URMA_TM_RM,
-        .priority = URMA_MAX_PRIORITY,
+        .priority = ctx->priority,
         .max_sge = 1,
         .max_inline_data = 0,
         .rnr_retry = URMA_TYPICAL_RNR_RETRY,
@@ -331,8 +368,9 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
         goto FREE_BUF;
     }
 
-    LOG_INFO("Initialized: device=%s, tp=%s, buf=%p, size=%lu MB",
-             ctx->urma_dev->name, tp_type_name(ctx->tp_type), ctx->buf,
+    LOG_INFO("Initialized: device=%s, tp=%s, priority=%u, buf=%p, size=%lu MB",
+             ctx->urma_dev->name, tp_type_name(ctx->tp_type),
+             (unsigned)ctx->priority, ctx->buf,
              (unsigned long)(buf_size / (1024 * 1024)));
     return ctx;
 

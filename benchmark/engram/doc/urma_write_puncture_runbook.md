@@ -179,6 +179,17 @@ URMA_TP_TYPE=ctp
 This is the default. Use `URMA_TP_TYPE=rtp` only to reproduce the failing
 default sample behavior.
 
+For `udma2`, `urma_admin show -d udma2 --whole` showed CTP on priorities 6 and
+7, while priority 15 is RTP:
+
+```text
+priority  : ... 6 7 ... 15
+tp_type   : ... CTP CTP ... RTP
+```
+
+Engram now auto-selects the first priority matching `URMA_TP_TYPE`, so CTP uses
+priority 6 instead of the old hard-coded `URMA_MAX_PRIORITY`/15.
+
 ## Run 64B
 
 Node1:
