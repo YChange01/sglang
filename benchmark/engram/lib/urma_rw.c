@@ -74,6 +74,7 @@ struct urma_rw_ctx {
 
     urma_token_t   token;
     uint64_t       rid;  /* request id counter */
+    urma_tp_type_t tp_type;
 
     /* Pre-allocated batch buffers (heap, not stack — DMA-safe) */
     urma_sge_t*    batch_src_sges;
@@ -128,6 +129,41 @@ static void do_urma_uninit(void)
     }
 }
 
+static const char* tp_type_name(urma_tp_type_t tp_type)
+{
+    switch (tp_type) {
+        case URMA_RTP:
+            return "rtp";
+        case URMA_CTP:
+            return "ctp";
+        case URMA_UTP:
+            return "utp";
+        default:
+            return "unknown";
+    }
+}
+
+static urma_tp_type_t parse_tp_type_env(void)
+{
+    const char* value = getenv("URMA_TP_TYPE");
+    if (!value || value[0] == '\0' ||
+        strcmp(value, "ctp") == 0 || strcmp(value, "CTP") == 0 ||
+        strcmp(value, "1") == 0) {
+        return URMA_CTP;
+    }
+    if (strcmp(value, "rtp") == 0 || strcmp(value, "RTP") == 0 ||
+        strcmp(value, "0") == 0) {
+        return URMA_RTP;
+    }
+    if (strcmp(value, "utp") == 0 || strcmp(value, "UTP") == 0 ||
+        strcmp(value, "2") == 0) {
+        return URMA_UTP;
+    }
+
+    LOG_ERR("Unknown URMA_TP_TYPE=%s; falling back to ctp", value);
+    return URMA_CTP;
+}
+
 urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
 {
     urma_rw_ctx_t* ctx = (urma_rw_ctx_t*)calloc(1, sizeof(urma_rw_ctx_t));
@@ -137,6 +173,7 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
     ctx->token.token = DEFAULT_TOKEN;
     ctx->listen_fd = -1;
     ctx->client_fd = -1;
+    ctx->tp_type = parse_tp_type_env();
 
     if (do_urma_init() != 0) goto FREE_CTX;
 
@@ -294,8 +331,8 @@ urma_rw_ctx_t* urma_rw_init(const char* dev_name, uint64_t buf_size)
         goto FREE_BUF;
     }
 
-    LOG_INFO("Initialized: device=%s, buf=%p, size=%lu MB",
-             ctx->urma_dev->name, ctx->buf,
+    LOG_INFO("Initialized: device=%s, tp=%s, buf=%p, size=%lu MB",
+             ctx->urma_dev->name, tp_type_name(ctx->tp_type), ctx->buf,
              (unsigned long)(buf_size / (1024 * 1024)));
     return ctx;
 
@@ -448,7 +485,7 @@ static int import_remote(urma_rw_ctx_t* ctx, const seg_jetty_info_t* remote)
         .jetty_id = remote->jetty_id,
         .trans_mode = URMA_TM_RM,
         .type = URMA_JETTY,
-        .tp_type = URMA_RTP,
+        .tp_type = ctx->tp_type,
         .flag.bs.order_type = 0,
         .flag.bs.share_tp = 0,
     };

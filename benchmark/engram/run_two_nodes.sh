@@ -17,6 +17,7 @@ TCP_PORT=${TCP_PORT:-13900}
 URMA_PORT=${URMA_PORT:-13857}
 URMA_PP_PORT=${URMA_PP_PORT:-13858}
 URMA_DEV=${URMA_DEV:-}
+URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
 
 # UBS-MEM provider hostnames. For read benchmarks, clients map objects created
 # by Node1, so READ_PROVIDER defaults to NODE1_PROVIDER.
@@ -28,7 +29,7 @@ READ_PROVIDER=${READ_PROVIDER:-$NODE1_PROVIDER}
 # Set URMA_WRITE_CQ_MOD=0 for pure posted WRITE with no CQ polling.
 URMA_WRITE_CQ_MOD=${URMA_WRITE_CQ_MOD:-64}
 
-export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT URMA_DEV
+export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT URMA_DEV URMA_TP_TYPE
 
 usage() {
     cat <<'EOF'
@@ -69,7 +70,8 @@ Common environment:
   TCP_PORT              default: 13900
   URMA_PORT             default: 13857
   URMA_PP_PORT          default: 13858
-  URMA_DEV              e.g. bonding_dev_0 or udma2
+  URMA_DEV              e.g. udma2
+  URMA_TP_TYPE          default: ctp; matches urma_sample -m 0 -t 1
   NODE1_PROVIDER        default: node1
   NODE2_PROVIDER        default: node2
   READ_PROVIDER         default: NODE1_PROVIDER
@@ -77,11 +79,11 @@ Common environment:
 
 Examples:
   # Node1: build and start unified read server
-  URMA_DEV=bonding_dev_0 ./run_two_nodes.sh node1 build
-  URMA_DEV=bonding_dev_0 ./run_two_nodes.sh node1 server
+  URMA_DEV=udma2 ./run_two_nodes.sh node1 build
+  URMA_DEV=udma2 ./run_two_nodes.sh node1 server
 
   # Node2: compare read puncture modes
-  SERVER_IP=192.168.84.245 URMA_DEV=bonding_dev_0 \
+  SERVER_IP=192.168.84.245 URMA_DEV=udma2 \
     ./run_two_nodes.sh node2 read-compare --iters 100000
 
   # UB-M noncache WRITE ping-pong, run Node1 first
@@ -89,8 +91,8 @@ Examples:
   ./run_two_nodes.sh node2 nc-write --bytes 512 --iters 100000
 
   # URMA WRITE ping-pong, run Node1 first
-  URMA_DEV=bonding_dev_0 ./run_two_nodes.sh node1 urma-write --bytes 512
-  SERVER_IP=192.168.84.245 URMA_DEV=bonding_dev_0 \
+  URMA_DEV=udma2 ./run_two_nodes.sh node1 urma-write --bytes 512
+  SERVER_IP=192.168.84.245 URMA_DEV=udma2 \
     ./run_two_nodes.sh node2 urma-write --bytes 512
 EOF
 }
@@ -104,6 +106,7 @@ print_env() {
     echo "URMA_PORT=$URMA_PORT"
     echo "URMA_PP_PORT=$URMA_PP_PORT"
     echo "URMA_DEV=${URMA_DEV:-auto}"
+    echo "URMA_TP_TYPE=$URMA_TP_TYPE"
     echo "NODE1_PROVIDER=$NODE1_PROVIDER"
     echo "NODE2_PROVIDER=$NODE2_PROVIDER"
     echo "READ_PROVIDER=$READ_PROVIDER"

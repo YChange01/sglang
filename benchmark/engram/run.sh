@@ -25,7 +25,8 @@
 #   SERVER_IP    — server IP (default: 192.168.84.245)
 #   TCP_PORT     — TCP data port (default: 13900)
 #   URMA_PORT    — URMA seg exchange port (default: 13857)
-#   URMA_DEV     — URMA device name (e.g. bonding_dev_0, udma2; default auto)
+#   URMA_DEV     — URMA device name (e.g. udma2; default auto)
+#   URMA_TP_TYPE — URMA TP type for RM mode: ctp|rtp|utp (default: ctp)
 
 set -e
 
@@ -41,6 +42,7 @@ URMA_PORT=${URMA_PORT:-13857}
 URMA_PP_PORT=${URMA_PP_PORT:-13858}
 PROVIDER=${PROVIDER:-node1}
 URMA_DEV=${URMA_DEV:-}
+URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
 
 if [ "$NUMA_NODE" = "none" ] || [ "$NUMA_NODE" = "off" ] || [ "$NUMA_NODE" = "-1" ]; then
     NUMA_CMD=""
@@ -209,7 +211,9 @@ case "${1:-help}" in
         echo "  server: $SERVER_IP:$URMA_PP_PORT"
         echo "  NUMA: $NUMA_DESC"
         echo "  URMA_DEV: ${URMA_DEV:-auto}"
+        echo "  URMA_TP_TYPE: $URMA_TP_TYPE"
         echo ""
+        export URMA_TP_TYPE
         $NUMA_CMD ./bench/urma_write_pingpong \
             --role "$ROLE" --server_ip "$SERVER_IP" --port "$URMA_PP_PORT" "$@"
         ;;
