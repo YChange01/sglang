@@ -40,13 +40,19 @@ READ_BENCH_BINS = \
 
 all: server bench
 
-server: server/server
+server: server/server server/read_server
 bench: $(READ_BENCH_BINS) bench/ubsmem_nc_write_pingpong bench/urma_write_pingpong
 
 server/server: server/server.c lib/urma_rw.c lib/urma_rw.h
 	$(CC) $(CFLAGS) $(UBSMEM_INC) $(URMA_INC) $(LIB_INC) \
 		-o $@ server/server.c lib/urma_rw.c \
 		$(UBSMEM_LIB) $(URMA_LIB) $(COMMON_LIBS)
+	@echo "Built $@"
+
+server/read_server: server/read_server.c lib/urma_rw.c lib/urma_rw.h
+	$(CC) $(CFLAGS) $(URMA_INC) $(LIB_INC) \
+		-o $@ server/read_server.c lib/urma_rw.c \
+		$(URMA_LIB) $(COMMON_LIBS)
 	@echo "Built $@"
 
 bench/bench_local: bench/bench_local.c
@@ -100,4 +106,4 @@ bench/urma_write_pingpong: bench/urma_write_pingpong.c lib/urma_rw.c lib/urma_rw
 	@echo "Built $@"
 
 clean:
-	rm -f server/server $(READ_BENCH_BINS) bench/ubsmem_nc_write_pingpong bench/urma_write_pingpong
+	rm -f server/server server/read_server $(READ_BENCH_BINS) bench/ubsmem_nc_write_pingpong bench/urma_write_pingpong

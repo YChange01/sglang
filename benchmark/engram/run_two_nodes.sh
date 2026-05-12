@@ -16,6 +16,7 @@ SERVER_IP=${SERVER_IP:-192.168.84.245}
 TCP_PORT=${TCP_PORT:-13900}
 URMA_PORT=${URMA_PORT:-13857}
 URMA_PP_PORT=${URMA_PP_PORT:-13858}
+READ_SERVER_MODES=${READ_SERVER_MODES:-tcp,urma}
 URMA_DEV=${URMA_DEV:-}
 URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
 URMA_PRIORITY=${URMA_PRIORITY:-}
@@ -30,7 +31,7 @@ READ_PROVIDER=${READ_PROVIDER:-$NODE1_PROVIDER}
 # Set URMA_WRITE_CQ_MOD=0 for pure posted WRITE with no CQ polling.
 URMA_WRITE_CQ_MOD=${URMA_WRITE_CQ_MOD:-64}
 
-export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT URMA_DEV URMA_TP_TYPE URMA_PRIORITY
+export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT READ_SERVER_MODES URMA_DEV URMA_TP_TYPE URMA_PRIORITY
 
 usage() {
     cat <<'EOF'
@@ -39,6 +40,7 @@ Usage:
   ./run_two_nodes.sh node2 build
 
   ./run_two_nodes.sh node1 server
+  ./run_two_nodes.sh node1 read-server
   SERVER_IP=<node1_ip> ./run_two_nodes.sh node2 read [mode] [options]
   SERVER_IP=<node1_ip> ./run_two_nodes.sh node2 read-compare [options]
   SERVER_IP=<node1_ip> ./run_two_nodes.sh node2 read-all [options]
@@ -71,6 +73,7 @@ Common environment:
   TCP_PORT              default: 13900
   URMA_PORT             default: 13857
   URMA_PP_PORT          default: 13858
+  READ_SERVER_MODES     default: tcp,urma; for read-server only
   URMA_DEV              e.g. udma2
   URMA_TP_TYPE          default: ctp; matches urma_sample -m 0 -t 1
   URMA_PRIORITY         optional JFS priority override, e.g. 6, 7, or 15
@@ -82,7 +85,7 @@ Common environment:
 Examples:
   # Node1: build and start unified read server
   URMA_DEV=udma2 ./run_two_nodes.sh node1 build
-  URMA_DEV=udma2 ./run_two_nodes.sh node1 server
+  URMA_DEV=udma2 ./run_two_nodes.sh node1 read-server
 
   # Node2: compare read puncture modes
   SERVER_IP=192.168.84.245 URMA_DEV=udma2 \
@@ -107,6 +110,7 @@ print_env() {
     echo "TCP_PORT=$TCP_PORT"
     echo "URMA_PORT=$URMA_PORT"
     echo "URMA_PP_PORT=$URMA_PP_PORT"
+    echo "READ_SERVER_MODES=$READ_SERVER_MODES"
     echo "URMA_DEV=${URMA_DEV:-auto}"
     echo "URMA_TP_TYPE=$URMA_TP_TYPE"
     echo "URMA_PRIORITY=${URMA_PRIORITY:-auto}"
@@ -145,6 +149,11 @@ run_build() {
 run_server() {
     need_node node1
     exec ./run.sh server "$@"
+}
+
+run_read_server() {
+    need_node node1
+    exec ./run.sh read-server "$@"
 }
 
 run_read() {
@@ -244,6 +253,9 @@ case "$ACTION" in
         ;;
     server)
         run_server "$@"
+        ;;
+    read-server|read_server)
+        run_read_server "$@"
         ;;
     read)
         run_read "$@"

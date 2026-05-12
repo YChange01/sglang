@@ -228,6 +228,52 @@ NUMA_NODE=none SERVER_IP=141.61.84.245 URMA_DEV=udma2 URMA_TP_TYPE=ctp \
 ./run_two_nodes.sh node2 urma-write --bytes 512 --iters 100000 --warmup 20000
 ```
 
+## TCP/URMA Read Without UBS-MEM
+
+When `ubsmd` is unavailable, use the lightweight read server instead of the
+unified server. It serves TCP and URMA READ from a local DRAM buffer and skips
+all UBS-MEM initialization.
+
+Node1:
+
+```bash
+cd /home/g00872988/sglang/benchmark/engram
+git pull
+make server bench
+
+NUMA_NODE=none \
+READ_SERVER_MODES=tcp,urma \
+URMA_DEV=udma2 \
+URMA_TP_TYPE=ctp \
+./run_two_nodes.sh node1 read-server
+```
+
+Node2 TCP read:
+
+```bash
+cd /home/g00872988/sglang/benchmark/engram
+git pull
+make bench
+
+NUMA_NODE=none \
+SERVER_IP=141.61.84.245 \
+./run_two_nodes.sh node2 read tcp --iters 1000
+```
+
+Node2 URMA read:
+
+```bash
+cd /home/g00872988/sglang/benchmark/engram
+NUMA_NODE=none \
+SERVER_IP=141.61.84.245 \
+URMA_DEV=udma2 \
+URMA_TP_TYPE=ctp \
+./run_two_nodes.sh node2 read urma --iters 1000
+```
+
+For isolated testing, start Node1 with `READ_SERVER_MODES=tcp` or
+`READ_SERVER_MODES=urma`.
+
 ## CQ Mode
 
 Default wrapper behavior:

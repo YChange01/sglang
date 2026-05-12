@@ -3,6 +3,7 @@
 #
 # Usage:
 #   ./run.sh server                         — Node1: start unified server
+#   ./run.sh read-server                    — Node1: TCP/URMA-only read server
 #   ./run.sh bench [mode] [options]         — Node2: run benchmark
 #   ./run.sh paper [options]                — Node2: paper reproduction (Engram-27B)
 #   ./run.sh all [options]                  — Node2: all benchmarks
@@ -25,6 +26,7 @@
 #   SERVER_IP    — server IP (default: 192.168.84.245)
 #   TCP_PORT     — TCP data port (default: 13900)
 #   URMA_PORT    — URMA seg exchange port (default: 13857)
+#   READ_SERVER_MODES — read-server modes: tcp, urma, tcp,urma (default)
 #   URMA_DEV     — URMA device name (e.g. udma2; default auto)
 #   URMA_TP_TYPE — URMA TP type for RM mode: ctp|rtp|utp (default: ctp)
 #   URMA_PRIORITY — optional JFS priority override (0..15; default auto)
@@ -41,6 +43,7 @@ SERVER_IP=${SERVER_IP:-192.168.84.245}
 TCP_PORT=${TCP_PORT:-13900}
 URMA_PORT=${URMA_PORT:-13857}
 URMA_PP_PORT=${URMA_PP_PORT:-13858}
+READ_SERVER_MODES=${READ_SERVER_MODES:-tcp,urma}
 PROVIDER=${PROVIDER:-node1}
 URMA_DEV=${URMA_DEV:-}
 URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
@@ -101,6 +104,20 @@ case "${1:-help}" in
         echo "  URMA_DEV: ${URMA_DEV:-auto}"
         echo ""
         $NUMA_CMD ./server/server $SIZE_MB $SHM_NAME $TCP_PORT $URMA_PORT
+        ;;
+
+    read-server)
+        echo "=== Starting Lightweight Read Server ==="
+        echo "  dataset: $SHM_NAME ($SIZE_MB MB)"
+        echo "  modes: $READ_SERVER_MODES"
+        echo "  TCP: :$TCP_PORT, URMA: :$URMA_PORT"
+        echo "  NUMA: $NUMA_DESC"
+        echo "  URMA_DEV: ${URMA_DEV:-auto}"
+        echo "  URMA_TP_TYPE: $URMA_TP_TYPE"
+        echo "  URMA_PRIORITY: ${URMA_PRIORITY:-auto}"
+        echo ""
+        export READ_SERVER_MODES URMA_TP_TYPE URMA_PRIORITY
+        $NUMA_CMD ./server/read_server $SIZE_MB $SHM_NAME $TCP_PORT $URMA_PORT
         ;;
 
     bench)
@@ -222,9 +239,10 @@ case "${1:-help}" in
         ;;
 
     help|*)
-        echo "Usage: $0 {server|bench|paper|e2e|local-read|tcp-read|urma-read|ubsmem-cache-read|ubsmem-nc-read|ubsmem-import-nc-read|ubsmem-huge-read|nc-write|urma-write|all} [options]"
+        echo "Usage: $0 {server|read-server|bench|paper|e2e|local-read|tcp-read|urma-read|ubsmem-cache-read|ubsmem-nc-read|ubsmem-import-nc-read|ubsmem-huge-read|nc-write|urma-write|all} [options]"
         echo ""
         echo "  server              Start unified server (Node1)"
+        echo "  read-server         Start TCP/URMA-only read server (Node1, no UBS-MEM)"
         echo "  bench [mode] [...]  Run micro benchmark (Node2)"
         echo "    modes: local, tcp, urma, ubsmem, ubsmem-nc, ubsmem-import-nc, ubsmem-huge, all"
         echo "  local-read          Standalone LOCAL read benchmark"
@@ -251,6 +269,7 @@ case "${1:-help}" in
         echo "  all                 Full micro benchmark suite"
         echo ""
         echo "Environment variables: NUMA_NODE, SIZE_MB, SHM_NAME, SERVER_IP,"
-        echo "  TCP_PORT, URMA_PORT, URMA_PP_PORT, PROVIDER, URMA_DEV"
+        echo "  TCP_PORT, URMA_PORT, URMA_PP_PORT, READ_SERVER_MODES,"
+        echo "  PROVIDER, URMA_DEV, URMA_TP_TYPE, URMA_PRIORITY"
         ;;
 esac
