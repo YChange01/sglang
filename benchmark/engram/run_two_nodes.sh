@@ -18,6 +18,7 @@ URMA_PORT=${URMA_PORT:-13857}
 URMA_PP_PORT=${URMA_PP_PORT:-13858}
 URMA_DEV=${URMA_DEV:-}
 URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
+URMA_PRIORITY=${URMA_PRIORITY:-}
 
 # UBS-MEM provider hostnames. For read benchmarks, clients map objects created
 # by Node1, so READ_PROVIDER defaults to NODE1_PROVIDER.
@@ -29,7 +30,7 @@ READ_PROVIDER=${READ_PROVIDER:-$NODE1_PROVIDER}
 # Set URMA_WRITE_CQ_MOD=0 for pure posted WRITE with no CQ polling.
 URMA_WRITE_CQ_MOD=${URMA_WRITE_CQ_MOD:-64}
 
-export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT URMA_DEV URMA_TP_TYPE
+export NUMA_NODE SIZE_MB SHM_NAME SERVER_IP TCP_PORT URMA_PORT URMA_PP_PORT URMA_DEV URMA_TP_TYPE URMA_PRIORITY
 
 usage() {
     cat <<'EOF'
@@ -72,6 +73,7 @@ Common environment:
   URMA_PP_PORT          default: 13858
   URMA_DEV              e.g. udma2
   URMA_TP_TYPE          default: ctp; matches urma_sample -m 0 -t 1
+  URMA_PRIORITY         optional JFS priority override, e.g. 6, 7, or 15
   NODE1_PROVIDER        default: node1
   NODE2_PROVIDER        default: node2
   READ_PROVIDER         default: NODE1_PROVIDER
@@ -107,6 +109,7 @@ print_env() {
     echo "URMA_PP_PORT=$URMA_PP_PORT"
     echo "URMA_DEV=${URMA_DEV:-auto}"
     echo "URMA_TP_TYPE=$URMA_TP_TYPE"
+    echo "URMA_PRIORITY=${URMA_PRIORITY:-auto}"
     echo "NODE1_PROVIDER=$NODE1_PROVIDER"
     echo "NODE2_PROVIDER=$NODE2_PROVIDER"
     echo "READ_PROVIDER=$READ_PROVIDER"

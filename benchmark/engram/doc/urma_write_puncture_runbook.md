@@ -187,8 +187,10 @@ priority  : ... 6 7 ... 15
 tp_type   : ... CTP CTP ... RTP
 ```
 
-Engram now auto-selects the first priority matching `URMA_TP_TYPE`, so CTP uses
-priority 6 instead of the old hard-coded `URMA_MAX_PRIORITY`/15.
+Engram auto-selects the first priority matching `URMA_TP_TYPE`, so CTP uses
+priority 6 by default. Because local measurements showed priority 15 can still
+be faster on this setup, use `URMA_PRIORITY=N` to force an A/B test for
+priorities 6, 7, and 15.
 
 ## Run 64B
 

@@ -187,6 +187,19 @@ static union urma_tp_type_en tp_type_mask(urma_tp_type_t tp_type)
 static uint8_t select_priority_for_tp(const urma_device_attr_t* attr,
                                       urma_tp_type_t tp_type)
 {
+    const char* override = getenv("URMA_PRIORITY");
+    if (override && override[0] != '\0') {
+        char* end = NULL;
+        errno = 0;
+        unsigned long value = strtoul(override, &end, 10);
+        if (errno == 0 && end != override && *end == '\0' &&
+            value <= URMA_MAX_PRIORITY) {
+            LOG_INFO("Using URMA_PRIORITY override: %lu", value);
+            return (uint8_t)value;
+        }
+        LOG_ERR("Invalid URMA_PRIORITY=%s; auto-selecting by tp", override);
+    }
+
     union urma_tp_type_en want = tp_type_mask(tp_type);
     for (uint8_t pri = 0; pri <= URMA_MAX_PRIORITY; pri++) {
         if (attr->dev_cap.priority_info[pri].tp_type.value == want.value) {

@@ -27,6 +27,7 @@
 #   URMA_PORT    — URMA seg exchange port (default: 13857)
 #   URMA_DEV     — URMA device name (e.g. udma2; default auto)
 #   URMA_TP_TYPE — URMA TP type for RM mode: ctp|rtp|utp (default: ctp)
+#   URMA_PRIORITY — optional JFS priority override (0..15; default auto)
 
 set -e
 
@@ -43,6 +44,7 @@ URMA_PP_PORT=${URMA_PP_PORT:-13858}
 PROVIDER=${PROVIDER:-node1}
 URMA_DEV=${URMA_DEV:-}
 URMA_TP_TYPE=${URMA_TP_TYPE:-ctp}
+URMA_PRIORITY=${URMA_PRIORITY:-}
 
 if [ "$NUMA_NODE" = "none" ] || [ "$NUMA_NODE" = "off" ] || [ "$NUMA_NODE" = "-1" ]; then
     NUMA_CMD=""
@@ -212,8 +214,9 @@ case "${1:-help}" in
         echo "  NUMA: $NUMA_DESC"
         echo "  URMA_DEV: ${URMA_DEV:-auto}"
         echo "  URMA_TP_TYPE: $URMA_TP_TYPE"
+        echo "  URMA_PRIORITY: ${URMA_PRIORITY:-auto}"
         echo ""
-        export URMA_TP_TYPE
+        export URMA_TP_TYPE URMA_PRIORITY
         $NUMA_CMD ./bench/urma_write_pingpong \
             --role "$ROLE" --server_ip "$SERVER_IP" --port "$URMA_PP_PORT" "$@"
         ;;
